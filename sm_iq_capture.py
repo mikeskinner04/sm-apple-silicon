@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """Capture I/Q from an SM200C on macOS through the patched transport.
 
-Reuses sm_transport.py for the vtable and semaphore patches, then drives the
-normal SM API: configure, smConfigure(smModeIQStreaming), smGetIQ in a loop.
-Signatures are taken from sm_api.h, not guessed.
+Reuses sm_transport.py (Python backend) or sm_native.py (--native, the C
+backend) for the vtable and semaphore patches, then drives the normal SM API:
+configure, smConfigure(smModeIQStreaming), smGetIQ in a loop. Signatures are
+taken from sm_api.h, not guessed.
 
     python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib \
         --host 192.168.2.2 --device 192.168.2.10 --port 51665 \
         --center 1e9 --decimation 64 --seconds 2
 
-Start with a high decimation. The kernel caps our socket receive buffer at
-8 MB against the 32 MB the device can keep in flight, and this transport
-receives datagram by datagram in Python, so low decimations will drop data.
+Decimation 1 (200 MS/s) needs the native backend; see docs/guide.md:
+
+    python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --native \
+        --decimation 1 --short --seconds 10 --discard
+
+Each capture writes raw interleaved samples to --out and a JSON sidecar beside
+it recording the settings, the transport's loss counters for that capture, and
+the sample positions of any zero-filled holes.
 """
 
 import argparse
 import ctypes
+import json
 import os
+import queue
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +39,8 @@ smModeIdle, smModeIQStreaming = 0, 3
 smIQStreamSampleRateNative = 0
 smFalse, smTrue = 0, 1
 NETWORKED_BASE_RATE = 200e6
+TRANSFER_MS = 2.62144          # one request; the queue is 2 to 16 of these
+SAMPLES_PER_DATAGRAM = 2048    # 8192-byte payload of 16-bit complex
 
 DEVICE_TYPES = {0: "SM200A", 1: "SM200B", 2: "SM200C", 3: "SM435B", 4: "SM435C"}
 
@@ -98,6 +109,127 @@ def describe(lib, dev):
               f"tx {tx.value:.3f} mW  rx {rx.value:.3f} mW")
 
 
+def raise_thread_qos():
+    """Put the calling thread in the user-interactive QoS band on macOS, so the
+    thread draining smGetIQ runs on a performance core. No-op elsewhere."""
+    if sys.platform != "darwin":
+        return
+    try:
+        libsys = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        libsys.pthread_set_qos_class_self_np(0x21, 0)   # QOS_CLASS_USER_INTERACTIVE
+    except (OSError, AttributeError):
+        pass
+
+
+def transport_counters(native, transport):
+    """Cumulative transport counters, from whichever backend is in use."""
+    if native is not None:
+        import sm_native as N
+        return N.stats(native).as_dict()
+    totals = {}
+    for st in transport.by_this.values():
+        for k in ("datagrams", "lost", "gaps", "resets"):
+            totals[k] = totals.get(k, 0) + st[k]
+    return totals
+
+
+def find_holes(path, short, min_run):
+    """Sample positions of zero-filled runs of at least min_run samples.
+
+    The native transport fills each lost datagram with zeros in place, so a
+    loss shows up in the capture as an exact run of 0+0j samples, 2048 per
+    datagram at hardware decimation. Receiver noise makes such runs impossible
+    in real data. Returns [[first_sample, length], ...].
+    """
+    import numpy as np
+    x = np.memmap(path, dtype=np.int16 if short else np.float32, mode="r")
+    x = x[: len(x) // 2 * 2].reshape(-1, 2)
+    holes, pending, step = [], None, 1 << 22
+    for off in range(0, len(x), step):
+        blk = x[off:off + step]
+        zero = (~blk.any(axis=1)).astype(np.int8)
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], zero, [0]))))
+        starts, ends = edges[0::2], edges[1::2]
+        if pending is not None and (len(starts) == 0 or starts[0] != 0):
+            if off - pending >= min_run:           # run ended on the boundary
+                holes.append([pending, off - pending])
+            pending = None
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            first = off + s
+            if s == 0 and pending is not None:
+                first, pending = pending, None
+            if e == len(blk):                      # may continue in the next block
+                pending = first
+                continue
+            if off + e - first >= min_run:
+                holes.append([first, off + e - first])
+    if pending is not None and len(x) - pending >= min_run:
+        holes.append([pending, len(x) - pending])
+    return holes
+
+
+def capture(lib, dev, out, total, rate, bytes_per_sample, discard):
+    """Read `total` samples with smGetIQ and write them to `out`.
+
+    A writer thread does the file I/O so the reading thread only ever waits on
+    the library. Both release the GIL: ctypes drops it around smGetIQ and
+    file.write drops it around the system call. Blocks are about 5 ms, so at
+    200 MS/s that is 200 calls a second rather than 6,000.
+    """
+    raise_thread_qos()
+    block = max(32768, min(1 << 20, int(rate * 0.005)))
+    free, full = queue.Queue(), queue.Queue()
+    for _ in range(8):
+        free.put(ctypes.create_string_buffer(block * bytes_per_sample))
+    failure = []
+
+    def writer():
+        with open(os.devnull if discard else out, "wb") as f:
+            while True:
+                item = full.get()
+                if item is None:
+                    return
+                buf, nbytes = item
+                try:
+                    if not discard:
+                        f.write(memoryview(buf).cast("B")[:nbytes])
+                except OSError as e:
+                    failure.append(e)
+                free.put(buf)
+
+    w = threading.Thread(target=writer, name="iq-writer")
+    w.start()
+    ns, first_ns = ctypes.c_int64(), None
+    loss, remaining = ctypes.c_int(), ctypes.c_int()
+    captured = flags = max_backlog = 0
+    started = time.monotonic()
+    try:
+        while captured < total and not failure:
+            n = min(block, total - captured)
+            buf = free.get()
+            status = lib.smGetIQ(dev, buf, n, None, 0, ctypes.byref(ns),
+                                 smTrue if captured == 0 else smFalse,
+                                 ctypes.byref(loss), ctypes.byref(remaining))
+            if status < 0:
+                free.put(buf)
+                print(f"  smGetIQ: {status} ({lib.smGetErrorString(status).decode()})")
+                break
+            if first_ns is None:
+                first_ns = ns.value
+            flags += bool(loss.value)
+            max_backlog = max(max_backlog, remaining.value)
+            full.put((buf, n * bytes_per_sample))
+            captured += n
+    finally:
+        full.put(None)
+        w.join()
+    if failure:
+        print(f"  write failed: {failure[0]}")
+    return {"samples": captured, "seconds": time.monotonic() - started,
+            "first_sample_ns": first_ns, "library_loss_flags": flags,
+            "max_backlog_ms": 1e3 * max_backlog / rate}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dylib")
@@ -112,22 +244,36 @@ def main():
     ap.add_argument("--queue-ms", type=float, default=None,
                     help="smSetIQQueueSize; smaller means faster retunes")
     ap.add_argument("--short", action="store_true", help="16-bit complex instead of 32-bit float")
+    ap.add_argument("--no-filter-repair", action="store_true",
+                    help="send the library's own filter uploads unmodified")
+    ap.add_argument("--native", action="store_true",
+                    help="use the native C backend (needed for decimation 1)")
+    ap.add_argument("--discard", action="store_true",
+                    help="read the stream but write nothing, to test the link without the disk")
+    ap.add_argument("--no-promote", action="store_true",
+                    help="native only: leave the library's thread priorities alone (A/B runs)")
     ap.add_argument("--out", default="capture.iq",
                     help="single frequency writes here; several get a -<MHz> suffix")
     args = ap.parse_args()
     centers = [float(c) for c in args.center.split(",")]
 
-    addrs = T.symbol_addresses(args.dylib, {T.VTABLE_SYM, T.ANCHOR_SYM})
-    lib = ctypes.CDLL(args.dylib)
-    bind(lib)
-    slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
-
-    transport = T.Transport()
-    T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
-    shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
-    if not os.path.exists(shim):
-        sys.exit("sem_shim.dylib not found; build it first")
-    T.patch_semaphores(args.dylib, slide, shim)
+    transport = native = None
+    if args.native:
+        import sm_native as N
+        lib, native = N.install(args.dylib, filter_repair=not args.no_filter_repair,
+                                promote=not args.no_promote)
+        bind(lib)
+    else:
+        addrs = T.symbol_addresses(args.dylib, {T.VTABLE_SYM, T.ANCHOR_SYM})
+        lib = ctypes.CDLL(args.dylib)
+        bind(lib)
+        slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
+        transport = T.Transport(T.load_filter_tables(not args.no_filter_repair))
+        T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
+        shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
+        if not os.path.exists(shim):
+            sys.exit("sem_shim.dylib not found; build it first")
+        T.patch_semaphores(args.dylib, slide, shim)
 
     handle = ctypes.c_int(-1)
     check(lib, lib.smOpenNetworkedDevice(ctypes.byref(handle), args.host.encode(),
@@ -148,10 +294,16 @@ def main():
     check(lib, lib.smSetIQBandwidth(dev, smFalse,
                                     NETWORKED_BASE_RATE / args.decimation * 0.8),
           "smSetIQBandwidth")
+    if args.queue_ms is None and args.decimation < 8:
+        # Below decimation 8 each request is a larger transfer and the stream
+        # is faster, so keep the most requests in flight the API allows.
+        args.queue_ms = 16 * TRANSFER_MS
+        print(f"  queue size {args.queue_ms:.2f} ms (16 requests, the maximum)")
     if args.queue_ms is not None:
         check(lib, lib.smSetIQQueueSize(dev, args.queue_ms), "smSetIQQueueSize")
+    hw_dec = min(args.decimation, 8)
+    min_hole = max(64, SAMPLES_PER_DATAGRAM * hw_dec // args.decimation)
 
-    total_losses = 0
     for n_freq, center in enumerate(centers):
         # Retuning means setting the frequency and reconfiguring. smConfigure
         # calls smAbort internally, so the engine thread is torn down and
@@ -178,55 +330,80 @@ def main():
             stem, ext = os.path.splitext(args.out)
             out = f"{stem}-{actual.value/1e6:.3f}MHz{ext}"
 
-        block = 32768
-        total = int(rate.value * args.seconds)
-        buf = ctypes.create_string_buffer(block * bytes_per_sample)
-        ns = ctypes.c_int64()
-        loss, remaining = ctypes.c_int(), ctypes.c_int()
+        before = transport_counters(native, transport)
+        result = capture(lib, dev, out, int(rate.value * args.seconds), rate.value,
+                         bytes_per_sample, args.discard)
+        after = transport_counters(native, transport)
+        delta = {k: after[k] - before.get(k, 0) for k in after
+                 if isinstance(after[k], int) and k not in
+                 ("rcvbuf", "rx_sched", "max_outstanding") and not k.startswith("lib_")}
 
-        captured, losses = 0, 0
-        started = time.monotonic()
-        with open(out, "wb") as f:
-            first = True
-            while captured < total:
-                n = min(block, total - captured)
-                status = lib.smGetIQ(dev, buf, n, None, 0, ctypes.byref(ns),
-                                     smTrue if first else smFalse,
-                                     ctypes.byref(loss), ctypes.byref(remaining))
-                if status < 0:
-                    print(f"  smGetIQ: {status} "
-                          f"({lib.smGetErrorString(status).decode()})")
-                    break
-                if loss.value:
-                    losses += 1
-                f.write(buf.raw[:n * bytes_per_sample])
-                captured += n
-                first = False
-        elapsed = time.monotonic() - started
-        total_losses += losses
-
+        captured, elapsed = result["samples"], result["seconds"]
         print(f"  captured {captured} samples in {elapsed:.2f} s "
-              f"({captured / elapsed / 1e6:.3f} MS/s sustained), "
-              f"loss flags {losses} -> {out}")
+              f"({captured / elapsed / 1e6:.3f} MS/s sustained)"
+              f"{'' if args.discard else ' -> ' + out}")
+        print(f"  library backlog peaked at {result['max_backlog_ms']:.1f} ms of its 500 ms")
 
-    print(f"\ntotal sample-loss flags: {total_losses}")
-    for st in transport.by_this.values():
-        print(f"datagram gaps: {st['gaps']}, lost: {st['lost']}, "
-              f"counter resets: {st['resets']}")
-        print(f"FinishDataXfer calls: {st['calls']}, datagrams: {st['datagrams']}, "
-              f"payload: {st['payload_bytes'] / 1e6:.2f} MB")
-        if st["scanned_bytes"]:
-            pct = 100.0 * st["zero_bytes"] / st["scanned_bytes"]
-            print(f"full scans: {st['nonzero_calls']} of {st['scanned_calls']} "
-                  f"transfers had any non-zero byte; {pct:.3f}% of scanned bytes zero")
-        print(f"requested transfer sizes seen: {sorted(st['req_seen'])}")
-        if st["raw_sample"]:
-            with open("raw_transfer.bin", "wb") as f:
-                f.write(st["raw_sample"])
-            print(f"wrote raw_transfer.bin ({len(st['raw_sample'])} bytes, "
-                  f"one untouched transfer straight off the wire)")
-    print(f"wrote {args.out} "
-          f"({'16-bit complex short' if args.short else '32-bit complex float'})")
+        holes = None
+        if native is not None and not args.discard and delta.get("lost", 0):
+            try:
+                holes = find_holes(out, args.short, min_hole)
+            except ImportError:
+                print("  numpy not installed; hole positions not scanned")
+
+        problems = []
+        if delta.get("lost"):
+            problems.append(f"{delta['lost']} datagrams lost in transit "
+                            f"({delta.get('aux_lost', 0)} of them aux blocks), zero-filled")
+        if delta.get("timeouts"):
+            problems.append(f"{delta['timeouts']} transfer timeouts; close and reopen "
+                            f"the device before trusting further captures")
+        if result["library_loss_flags"]:
+            problems.append(f"{result['library_loss_flags']} blocks flagged by the device "
+                            f"as sample loss (requests fell behind)")
+        if delta.get("resets"):
+            problems.append(f"{delta['resets']} counter restarts")
+        if holes:
+            span = sum(h[1] for h in holes)
+            problems.append(f"{len(holes)} zero-filled holes, {span} samples, "
+                            f"positions in the sidecar")
+        print("  clean: no loss anywhere" if not problems else
+              "  DATA LOSS:\n    " + "\n    ".join(problems))
+
+        if not args.discard:
+            meta = {
+                "file": os.path.basename(out),
+                "datatype": "ci16_le" if args.short else "cf32_le",
+                "sample_rate": rate.value, "bandwidth": bw.value,
+                "center_hz": actual.value, "decimation": args.decimation,
+                "iq_correction": scale.value,
+                "note": "16-bit samples need multiplying by iq_correction" if args.short else "",
+                **result,
+                "transport": delta,
+                "holes": holes,
+            }
+            with open(out + ".json", "w") as f:
+                json.dump(meta, f, indent=1)
+
+    if native is not None:
+        import sm_native as N
+        s = N.stats(native)
+        print(f"\nsession: {s.transfers} transfers, {s.datagrams} datagrams, "
+              f"{s.payload_bytes / 1e6:.1f} MB, lost {s.lost}, timeouts {s.timeouts}, "
+              f"filter repairs {s.filter_repairs}")
+        print(f"socket buffer {s.rcvbuf / 2**20:.0f} MB, receiver thread "
+              f"{N.RX_SCHED.get(s.rx_sched, s.rx_sched)}, deepest queue "
+              f"{s.max_outstanding}, queue ran dry {s.queue_empty} times")
+        if s.lib_prio_low:
+            policy = {1: "timeshare", 2: "round robin", 4: "fixed (FIFO)"}.get(
+                s.lib_policy_low, str(s.lib_policy_low))
+            print(f"library thread seen at {policy} priority {s.lib_prio_low}; "
+                  + (f"moved to priority {s.lib_prio_after}" if s.lib_promotions
+                     else "left alone (--no-promote)"))
+    else:
+        for st in transport.by_this.values():
+            print(f"\nsession: {st['datagrams']} datagrams, gaps {st['gaps']}, "
+                  f"lost {st['lost']}, counter resets {st['resets']}")
 
     lib.smAbort(dev)
     lib.smCloseDevice(dev)

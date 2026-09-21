@@ -447,6 +447,8 @@ def main():
     ap.add_argument("--keep-samples", type=int, default=65536,
                     help="samples to save per experiment, 0 to skip")
     ap.add_argument("--outdir", default="sm_diag_out")
+    ap.add_argument("--no-filter-repair", action="store_true",
+                    help="send the library's own filter uploads unmodified")
     args = ap.parse_args()
 
     if args.list:
@@ -476,7 +478,7 @@ def main():
     lib = ctypes.CDLL(args.dylib)
     bind(lib)
     slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
-    transport = T.Transport()
+    transport = T.Transport(T.load_filter_tables(not args.no_filter_repair))
     T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
     shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
     if not os.path.exists(shim):
@@ -541,9 +543,13 @@ def main():
         if kind == "sweep":
             print(f"  peak {r.get('peak_dBm')} dBm at {r.get('peak_freq_Hz')} Hz, "
                   f"median {r.get('median_dBm')} dBm, flat={r.get('all_identical')}")
+        if t.get("filter_repairs"):
+            stages = sorted({r["stage"] for r in t["filter_repairs"]})
+            print(f"  repaired impulse filter uploads for stages {stages}")
         if head:
             print(f"  head {head[:72]}")
         report["experiments"].append(entry)
+    report["filter_repair"] = transport.filter_tables is not None
 
     report["api_errors"] = api.log
     api("smAbort", dev)

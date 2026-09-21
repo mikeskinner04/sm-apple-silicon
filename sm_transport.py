@@ -24,6 +24,9 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sm_filters
+
 # Learned from the binary. See notes at the bottom of this file.
 CMD_BYTES = 0x800          # commands are fixed 2048-byte datagrams
 HDR_BYTES = 8              # per-datagram header, stripped from the payload
@@ -144,11 +147,31 @@ def symbol_addresses(path, wanted):
     return found
 
 
+
+def load_filter_tables(enabled=True):
+    """Load filter_tables.json from beside this file, if repair is wanted.
+
+    Produce it once with:  python3 sm_filters.py extract <path to a Linux .so>
+    """
+    if not enabled:
+        print("filter repair disabled; I/Q filter uploads sent as the library built them")
+        return None
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), sm_filters.TABLES_FILE)
+    if not os.path.exists(path):
+        print(f"no {sm_filters.TABLES_FILE}; I/Q filter uploads will not be repaired")
+        return None
+    tables = sm_filters.load_tables(path)
+    print(f"filter repair on: shipped tables for {sorted(tables)} taps")
+    return tables
+
 class Transport:
     """Per-interface state, keyed by the C++ `this` pointer."""
 
-    def __init__(self):
+    def __init__(self, filter_tables=None):
         self.by_this = {}
+        # Signal Hound's shipped decimation filter coefficients, used to repair
+        # the impulse uploads the macOS build sends. None disables repair.
+        self.filter_tables = filter_tables
 
     def state(self, this):
         st = self.by_this.get(this)
@@ -177,6 +200,7 @@ class Transport:
                 "resets": 0,
                 "commands": [],
                 "aux_blocks": [],
+                "filter_repairs": [],
                 "req_seen": set(),
             }
             self.by_this[this] = st
@@ -185,7 +209,7 @@ class Transport:
     def snapshot(self):
         """Counters and captured artefacts across all interfaces, then clear."""
         out = {c: 0 for c in COUNTERS}
-        commands, aux, raw = [], [], None
+        commands, aux, raw, repairs = [], [], None, []
         for st in self.by_this.values():
             for c in COUNTERS:
                 out[c] += st[c]
@@ -193,12 +217,15 @@ class Transport:
             out.setdefault("req_seen", set()).update(st["req_seen"])
             commands.extend(st["commands"])
             aux.extend(st["aux_blocks"])
+            repairs.extend(st["filter_repairs"])
+            st["filter_repairs"] = []
             raw = raw or st["raw_sample"]
             st["commands"], st["aux_blocks"], st["raw_sample"] = [], [], None
             st["req_seen"] = set()
         out["req_seen"] = sorted(out.get("req_seen", set()))
         out["commands"] = commands
         out["aux_blocks"] = [a.hex() for a in aux]
+        out["filter_repairs"] = repairs
         out["raw_sample"] = raw
         return out
 
@@ -244,11 +271,19 @@ class Transport:
         payload = ctypes.string_at(cmd_ptr, CMD_BYTES)
         if len(st["commands"]) < MAX_LOGGED_COMMANDS:
             # Commands are 32-bit words, opcode in the top byte. Trailing zeros
-            # are padding to the fixed 2048-byte packet, so trim them.
+            # are padding to the fixed 2048-byte packet, so trim them. Logged
+            # before any repair, so the log shows what the library produced.
             words = struct.unpack(f"<{CMD_BYTES // 4}I", payload)
             while words and words[-1] == 0:
                 words = words[:-1]
             st["commands"].append(list(words))
+        if self.filter_tables is not None:
+            words = list(struct.unpack(f"<{CMD_BYTES // 4}I", payload))
+            words, report = sm_filters.repair_packet(words, self.filter_tables)
+            if any(r["impulse"] for r in report):
+                payload = struct.pack(f"<{CMD_BYTES // 4}I",
+                                      *[w & 0xFFFFFFFF for w in words])
+                st["filter_repairs"].extend(r for r in report if r["impulse"])
         try:
             st["cmd_sent"][idx] = st["sock"].send(payload)
         except OSError as e:
@@ -400,7 +435,7 @@ def main():
     slide = runtime - addrs[ANCHOR_SYM]
     print(f"api {lib.smGetAPIVersion().decode()}  slide {slide:#x}")
 
-    transport = Transport()
+    transport = Transport(load_filter_tables())
     patch_vtable(addrs[VTABLE_SYM] + slide, transport)
 
     shim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
