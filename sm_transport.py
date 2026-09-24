@@ -22,6 +22,7 @@ enough for native rate.
 import ctypes
 import os
 import struct
+import time
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +149,67 @@ def symbol_addresses(path, wanted):
 
 
 
+class InterfaceStatus:
+    """The library's per-device transfer status: read it, and clear it.
+
+    DeviceInterface keeps one int that any failed command or data transfer sets
+    to -6, smConnectionLostErr. Nothing on the networked path ever clears it,
+    and the I/Q engine refuses to return samples while it is set, so a single
+    failure anywhere, even an aux fetch behind a getter, ends the session.
+
+    Located by symbol and decoded from the instructions that use it, not hard
+    coded: `_deviceList` is the handle table, `SmDevice::UpdateAuxData` loads
+    the interface with `ldr x0, [xN, #off]`, and
+    `DeviceInterface::TransferStatus` is `ldr w0, [x0, #off]; ret`.
+    """
+
+    SYMS = {"_deviceList", "__ZN8SmDevice13UpdateAuxDataEb",
+            "__ZNK15DeviceInterface14TransferStatusEv"}
+
+    def __init__(self, path, slide):
+        a = symbol_addresses(path, self.SYMS)
+        self.table = a["_deviceList"] + slide
+        self.iface_off = self._ldr_offset(a["__ZN8SmDevice13UpdateAuxDataEb"] + slide, 20, 8)
+        self.status_off = self._ldr_offset(
+            a["__ZNK15DeviceInterface14TransferStatusEv"] + slide, 1, 4)
+        if self.iface_off is None or self.status_off is None:
+            raise RuntimeError("could not decode the interface status offsets; "
+                               "the library layout has changed")
+
+    @staticmethod
+    def _ldr_offset(addr, count, scale):
+        """Offset of the first `ldr x0/w0, [xN, #imm]` among `count` instructions."""
+        opcode = 0xF9400000 if scale == 8 else 0xB9400000
+        for i in range(count):
+            w = ctypes.c_uint32.from_address(addr + 4 * i).value
+            if (w & 0xFFC00000) == opcode and (w & 31) == 0:
+                return ((w >> 10) & 0xFFF) * scale
+        return None
+
+    def _field(self, dev):
+        if not 0 <= dev < 16:
+            return None
+        device = ctypes.c_void_p.from_address(self.table + 8 * dev).value
+        iface = device and ctypes.c_void_p.from_address(device + self.iface_off).value
+        return iface + self.status_off if iface else None
+
+    def read(self, dev):
+        """The status for a handle: 0, -6, or None if there is no device."""
+        f = self._field(dev)
+        return None if f is None else ctypes.c_int32.from_address(f).value
+
+    def clear(self, dev):
+        """Set it back to 0, as the USB path does once at connect. Returns the
+        value it had. If the device really has gone, the next transfer fails
+        and sets it again."""
+        f = self._field(dev)
+        if f is None:
+            return None
+        old = ctypes.c_int32.from_address(f).value
+        ctypes.c_int32.from_address(f).value = 0
+        return old
+
+
 def load_filter_tables(enabled=True):
     """Load filter_tables.json from beside this file, if repair is wanted.
 
@@ -202,14 +264,21 @@ class Transport:
                 "aux_blocks": [],
                 "filter_repairs": [],
                 "req_seen": set(),
+                "events": [],
             }
             self.by_this[this] = st
         return st
 
+    @staticmethod
+    def event(st, kind, **detail):
+        """Record a transport failure so it reaches the report, not just stdout."""
+        if len(st["events"]) < 50:
+            st["events"].append({"kind": kind, "t": round(time.monotonic(), 3), **detail})
+
     def snapshot(self):
         """Counters and captured artefacts across all interfaces, then clear."""
         out = {c: 0 for c in COUNTERS}
-        commands, aux, raw, repairs = [], [], None, []
+        commands, aux, raw, repairs, events = [], [], None, [], []
         for st in self.by_this.values():
             for c in COUNTERS:
                 out[c] += st[c]
@@ -219,6 +288,8 @@ class Transport:
             aux.extend(st["aux_blocks"])
             repairs.extend(st["filter_repairs"])
             st["filter_repairs"] = []
+            events.extend(st["events"])
+            st["events"] = []
             raw = raw or st["raw_sample"]
             st["commands"], st["aux_blocks"], st["raw_sample"] = [], [], None
             st["req_seen"] = set()
@@ -226,6 +297,7 @@ class Transport:
         out["commands"] = commands
         out["aux_blocks"] = [a.hex() for a in aux]
         out["filter_repairs"] = repairs
+        out["events"] = events
         out["raw_sample"] = raw
         return out
 
@@ -286,9 +358,11 @@ class Transport:
                 st["filter_repairs"].extend(r for r in report if r["impulse"])
         try:
             st["cmd_sent"][idx] = st["sock"].send(payload)
-        except OSError as e:
+        except (OSError, AttributeError) as e:
             print(f"  ! send failed: {e}")
             st["cmd_sent"][idx] = 0
+            self.event(st, "send_failed", slot=idx, error=str(e),
+                       first_word=f"{struct.unpack_from('<I', payload)[0]:#010x}")
 
     def finish_cmd(self, this, idx):
         st = self.state(this)
@@ -327,6 +401,8 @@ class Transport:
             except OSError as e:
                 print(f"  ! recv timeout/error on slot {idx} after {i} msgs: {e}")
                 st["timed_out"][idx] = True
+                self.event(st, "recv_failed", slot=idx, requested=want,
+                           datagrams_wanted=nmsgs, datagrams_got=i, error=str(e))
                 break
             if len(st["headers"]) < 32:
                 st["headers"].append(bytes(hdr))

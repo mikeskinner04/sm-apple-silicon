@@ -136,8 +136,21 @@ single 1.0 at the centre: a unit impulse rather than a low-pass. After
 bits where real filters need 17. Sweep uses a different upload path, which is
 why sweeps work and I/Q does not. The Linux builds write these stages from
 constant tables; `sm_filters.py` extracts them from your copy and both backends
-substitute them into outgoing command packets. Built and tested offline, awaiting
-confirmation on hardware.
+substitute them into outgoing command packets. On hardware the uploads have now
+been seen leaving the library as impulses and being replaced. Whether that
+yields real samples is the next thing to confirm.
+
+The first diagnostics runs could not show that. The harness ran
+`smNetworkedSpeedTest` before its experiments, the speed test always fails on
+the Python transport, and one failure sets a connection-lost status the library
+never clears. Every I/Q experiment then failed without capturing anything, and
+the report called that zeros. The harness no longer runs it, and now records
+that status throughout; see `docs/findings.md`.
+
+To settle whether the filters are the cause, the harness runs a built-in A/B:
+`iq-ab-repair-on` and `iq-ab-repair-off`, the same settings with repair on then
+off, in one session. It prints a plain verdict comparing the two, so a single
+run answers the question rather than two runs into separate directories.
 
 Decimation 1 is built and tested offline, against a simulator that reproduces
 the device's wire format, counter behaviour and request-driven flow. Reading the

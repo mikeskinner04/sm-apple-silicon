@@ -342,8 +342,17 @@ EXPERIMENTS = {
 }
 
 
-def device_state(api, dev, lib):
-    """Everything queryable that costs nothing and might matter."""
+def device_state(api, dev, lib, trace):
+    """Everything queryable that costs nothing and might matter.
+
+    Several of these getters fetch the aux block from the device, and a failed
+    fetch sets the library's sticky connection-lost status, so `trace` records
+    the status after each call.
+
+    No smNetworkedSpeedTest here: it keeps 32 MB of dummy data in flight at line
+    rate, which the Python transport cannot drain, so it always failed and left
+    the status stuck at -6 before the first experiment.
+    """
     out = {}
     dtype, serial = ctypes.c_int(), ctypes.c_int()
     api("smGetDeviceInfo", dev, ctypes.byref(dtype), ctypes.byref(serial))
@@ -354,12 +363,14 @@ def device_state(api, dev, lib):
         ctypes.byref(rev))
     out["firmware"] = f"{maj.value}.{mnr.value}.{rev.value}"
     out["api_version"] = lib.smGetAPIVersion().decode()
+    trace("smGetDeviceInfo, smGetFirmwareVersion")
 
     for label, name, count in (("diagnostics", "smGetDeviceDiagnostics", 3),
                                ("sfp", "smGetSFPDiagnostics", 4)):
         vals = [ctypes.c_float() for _ in range(count)]
         if api(name, dev, *[ctypes.byref(v) for v in vals]) == 0:
             out[label] = [round(v.value, 3) for v in vals]
+        trace(name)
 
     for label, name in (("power_state", "smGetPowerState"),
                         ("reference", "smGetReference"),
@@ -370,15 +381,12 @@ def device_state(api, dev, lib):
         v = ctypes.c_int()
         if api(name, dev, ctypes.byref(v)) == 0:
             out[label] = v.value
+        trace(name)
 
     cal = ctypes.c_uint64()
     if api("smGetCalDate", dev, ctypes.byref(cal)) == 0 and cal.value:
         out["last_cal"] = time.strftime("%Y-%m-%d", time.gmtime(cal.value))
-
-    # 10GbE link throughput, independent of any measurement mode
-    bps = ctypes.c_double()
-    if api("smNetworkedSpeedTest", dev, 1.0, ctypes.byref(bps)) == 0:
-        out["link_MBps"] = round(bps.value / 1e6, 1)
+    trace("smGetCalDate")
     return out
 
 
@@ -395,7 +403,7 @@ th{font-weight:600;color:var(--dim)}
 details{border:1px solid var(--line);border-radius:6px;padding:8px 12px;margin:6px 0}
 summary{cursor:pointer;font-weight:600} pre{overflow-x:auto;font-size:12px;color:var(--dim)}
 </style>
-<h1>SM200C on macOS &mdash; diagnostics</h1>
+<h1>SM200C on macOS: diagnostics</h1>
 <div class=dim id=meta></div><div id=body></div>
 <script>
 const R = REPORT_JSON;
@@ -404,11 +412,22 @@ document.getElementById('meta').textContent =
   `${R.device.device_type||'?'} serial ${R.device.serial||'?'} · firmware ${R.device.firmware||'?'} · API ${R.device.api_version||'?'} · ${R.started}`;
 let h = '<h2>Device state</h2><table><tr><th>field</th><th>value</th></tr>';
 for (const [k,v] of Object.entries(R.device)) h += `<tr><td>${esc(k)}</td><td>${esc(JSON.stringify(v))}</td></tr>`;
-h += '</table><h2>Experiments</h2><table><tr><th>name</th><th>verdict</th><th>rate</th><th>output non-zero</th><th>payload</th><th>loss</th></tr>';
+h += '</table><h2>Connection-lost status during setup</h2>'
+  + '<div class=dim>-6 means a transfer or command failed. The library never clears it on its own, '
+  + 'so everything after it fails. Each experiment below starts with it cleared.</div>'
+  + '<table><tr><th>after</th><th>status</th></tr>';
+for (const t of (R.status_trace || [])) h += `<tr><td>${esc(t.after)}</td><td class=${t.status ? 'bad' : 'ok'}>${esc(t.status)}</td></tr>`;
+h += '</table>';
+const ev = [...((R.open_phase||{}).events||[]), ...((R.state_phase||{}).events||[])];
+if (ev.length) h += '<div class=bad>Transport failures during setup: ' + esc(JSON.stringify(ev)) + '</div>';
+h += '<h2>Experiments</h2><table><tr><th>name</th><th>verdict</th><th>rate</th><th>output non-zero</th><th>payload</th><th>loss</th><th>status in</th><th>status out</th></tr>';
 for (const e of R.experiments) {
   const r = e.result || {};
   let verdict = 'ran', cls = '';
   if (e.error || r.error) { verdict = 'failed'; cls = 'bad'; }
+  else if (e.kind === 'iq' && !r.captured_samples) {
+    verdict = 'no data: ' + (r.getiq_error || 'nothing captured'); cls = 'bad';
+  }
   else if (e.kind === 'iq') {
     if (r.output_nonzero_pct > 0.5) { verdict = 'real samples'; cls = 'ok'; }
     else { verdict = 'zeros'; cls = 'bad'; }
@@ -421,7 +440,9 @@ for (const e of R.experiments) {
     + `<td>${r.sustained_MSps ? r.sustained_MSps+' MS/s' : (r.peak_dBm!==undefined ? r.peak_dBm+' dBm peak' : '&mdash;')}</td>`
     + `<td>${r.output_nonzero_pct!==undefined ? r.output_nonzero_pct+'%' : '&mdash;'}</td>`
     + `<td>${t.payload_bytes ? (t.payload_bytes/1e6).toFixed(1)+' MB' : '&mdash;'}</td>`
-    + `<td>${r.sample_loss_flags!==undefined ? r.sample_loss_flags : '&mdash;'}</td></tr>`;
+    + `<td>${r.sample_loss_flags!==undefined ? r.sample_loss_flags : '&mdash;'}</td>`
+    + `<td class=${e.status_in ? 'warn' : ''}>${e.status_in ?? '&mdash;'}</td>`
+    + `<td class=${e.status_out ? 'bad' : ''}>${e.status_out ?? '&mdash;'}</td></tr>`;
 }
 h += '</table>';
 for (const e of R.experiments) {
@@ -494,24 +515,46 @@ def main():
     dev = handle.value
 
     open_transport = transport.snapshot()
+    status = T.InterfaceStatus(args.dylib, slide)
+    status_trace = [{"after": "smOpenNetworkedDevice", "status": status.read(dev)}]
+
+    def trace(call):
+        status_trace.append({"after": call, "status": status.read(dev)})
+
+    device = device_state(api, dev, lib, trace)
+    state_transport = transport.snapshot()
     report = {
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "host": args.host, "device_addr": args.device, "port": args.port,
         "dylib": os.path.abspath(args.dylib),
-        "device": device_state(api, dev, lib),
+        "device": device,
+        "status_trace": status_trace,
         "open_phase": {
             "commands": summarise_commands(open_transport["commands"]),
             "datagrams": open_transport["datagrams"],
             "payload_bytes": open_transport["payload_bytes"],
+            "events": open_transport["events"],
+        },
+        "state_phase": {
+            "datagrams": state_transport["datagrams"],
+            "events": state_transport["events"],
         },
         "experiments": [],
     }
+    stuck = next((t["after"] for t in status_trace if t["status"]), None)
+    if stuck:
+        print(f"\n! the connection-lost status was set during {stuck}")
     print(json.dumps(report["device"], indent=2))
 
     for name in names:
         kind, cfg, why = EXPERIMENTS[name]
         print(f"\n--- {name} ({kind}) ---")
         entry = {"name": name, "kind": kind, "config": dict(cfg), "why": why}
+        # Each experiment starts clean. A status left at -6 by an earlier one
+        # would otherwise fail everything after it; record that it happened.
+        entry["status_in"] = status.clear(dev)
+        if entry["status_in"]:
+            print(f"  status was {entry['status_in']} on entry; cleared")
         try:
             if kind == "iq":
                 r = run_iq(api, dev, transport, cfg, args.seconds, args.keep_samples)
@@ -522,6 +565,7 @@ def main():
             traceback.print_exc()
             entry["error"] = f"{type(exc).__name__}: {exc}"
             r = {"transport": transport.snapshot()}
+        entry["status_out"] = status.read(dev)
         t = r.pop("transport", {})
         raw = t.pop("raw_sample", None)
         if raw:
@@ -535,9 +579,13 @@ def main():
         entry["result"] = r
 
         head = r.get("sample_head", "")
-        verdict = ("real samples" if r.get("output_nonzero_pct", 0) > 0.5
-                   else "ZEROS" if kind == "iq" else "")
-        print(f"  {verdict}  non-zero {r.get('output_nonzero_pct', '-')}%  "
+        if kind == "iq" and not r.get("captured_samples"):
+            verdict = f"NO DATA ({r.get('getiq_error') or r.get('error') or 'nothing captured'})"
+        else:
+            verdict = ("real samples" if r.get("output_nonzero_pct", 0) > 0.5
+                       else "ZEROS" if kind == "iq" else "")
+        print(f"  {verdict}  status out {entry['status_out']}  "
+              f"non-zero {r.get('output_nonzero_pct', '-')}%  "
               f"payload {t.get('payload_bytes', 0)/1e6:.1f} MB  "
               f"loss {r.get('sample_loss_flags', '-')}")
         if kind == "sweep":

@@ -275,6 +275,10 @@ def main():
             sys.exit("sem_shim.dylib not found; build it first")
         T.patch_semaphores(args.dylib, slide, shim)
 
+    anchor = T.symbol_addresses(args.dylib, {T.ANCHOR_SYM})[T.ANCHOR_SYM]
+    status = T.InterfaceStatus(
+        args.dylib, ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - anchor)
+
     handle = ctypes.c_int(-1)
     check(lib, lib.smOpenNetworkedDevice(ctypes.byref(handle), args.host.encode(),
                                          args.device.encode(), args.port), "open")
@@ -308,6 +312,13 @@ def main():
         # Retuning means setting the frequency and reconfiguring. smConfigure
         # calls smAbort internally, so the engine thread is torn down and
         # rebuilt on every hop.
+        # One failed transfer anywhere leaves the library's connection-lost
+        # status at -6 for good, and smGetIQ then refuses every call. Start
+        # each capture clean and say so if it was set.
+        status_in = status.clear(dev)
+        if status_in:
+            print(f"  connection-lost status was stuck at {status_in} from an earlier "
+                  f"failed transfer; cleared")
         tune_start = time.monotonic()
         check(lib, lib.smSetIQCenterFreq(dev, center), "smSetIQCenterFreq")
         check(lib, lib.smConfigure(dev, smModeIQStreaming), "smConfigure")
@@ -363,6 +374,10 @@ def main():
                             f"as sample loss (requests fell behind)")
         if delta.get("resets"):
             problems.append(f"{delta['resets']} counter restarts")
+        status_out = status.read(dev)
+        if status_out:
+            problems.append(f"connection-lost status set to {status_out} during the capture: "
+                            f"a transfer or command failed")
         if holes:
             span = sum(h[1] for h in holes)
             problems.append(f"{len(holes)} zero-filled holes, {span} samples, "
@@ -380,6 +395,7 @@ def main():
                 "note": "16-bit samples need multiplying by iq_correction" if args.short else "",
                 **result,
                 "transport": delta,
+                "status_in": status_in, "status_out": status_out,
                 "holes": holes,
             }
             with open(out + ".json", "w") as f:
