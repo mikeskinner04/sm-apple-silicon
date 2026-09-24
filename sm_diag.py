@@ -155,10 +155,24 @@ def summarise_commands(commands):
 
 # ---- experiments ------------------------------------------------------------
 def run_iq(api, dev, transport, cfg, seconds, keep_samples):
-    """Configure I/Q streaming, pull samples, report what actually arrived."""
+    """Configure I/Q streaming, pull samples, report what actually arrived.
+
+    cfg["repair"], if present, overrides filter repair for this one experiment:
+    True forces it on, False forces it off. This is what lets an A/B pair run in
+    a single session. The transport reads filter_tables at packet time, so
+    flipping it here takes effect for this experiment's uploads and is restored
+    afterwards.
+    """
     short = cfg.get("short", False)
     bps = 4 if short else 8
     result = {}
+
+    saved_tables = transport.filter_tables
+    if cfg.get("repair") is False:
+        transport.filter_tables = None
+    elif cfg.get("repair") is True and transport.shipped_tables is None:
+        result["repair_note"] = "repair forced on but no filter_tables.json loaded"
+    result["repair_active"] = transport.filter_tables is not None
 
     api("smAbort", dev)
     api("smSetIQBaseSampleRate", dev, cfg.get("base_rate", smIQStreamSampleRateNative))
@@ -186,6 +200,7 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     if status < 0:
         result["error"] = api.err(status)
         result["transport"] = transport.snapshot()
+        transport.filter_tables = saved_tables
         return result
 
     rate, bw, actual = ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
@@ -242,6 +257,7 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     )
     result["transport"] = transport.snapshot()
     api("smAbort", dev)
+    transport.filter_tables = saved_tables
     return result
 
 
@@ -314,13 +330,25 @@ EXPERIMENTS = {
     "iq-dec8-short": ("iq", {"decimation": 8, "center": 1e9, "short": True},
                       "Hardware-only decimation, 16-bit: skips the whole software "
                       "DSP chain including the stubbed FIR."),
+    # The A/B that answers the filter question in one session. Same settings,
+    # repair on then off. If repaired is non-zero and the raw one is zeros, the
+    # impulse filters are the cause. Run these two together and compare.
+    "iq-ab-repair-on": ("iq", {"decimation": 8, "center": 1e9, "short": True,
+                               "repair": True},
+                        "A/B, repair ON: filters replaced with shipped coefficients."),
+    "iq-ab-repair-off": ("iq", {"decimation": 8, "center": 1e9, "short": True,
+                                "repair": False},
+                         "A/B, repair OFF: the library's own impulse filters, "
+                         "same settings as iq-ab-repair-on."),
     "iq-dec8-float": ("iq", {"decimation": 8, "center": 1e9},
                       "Same path but with the 16sc to 32fc conversion in play."),
     "iq-dec16-short": ("iq", {"decimation": 16, "center": 1e9, "short": True},
                        "First decimation that engages software filtering."),
-    "iq-dec1-short": ("iq", {"decimation": 1, "center": 1e9, "short": True},
-                      "Native 200 MS/s. Expect loss; we care whether bytes are "
-                      "non-zero, not whether it keeps up."),
+    "iq-dec1-short": ("iq", {"decimation": 1, "center": 1e9, "short": True,
+                             "native_only": True},
+                      "Native 200 MS/s. The Python transport cannot keep up, so "
+                      "this is expected to fail here and is skipped unless asked "
+                      "for; it is the native backend's job."),
     "iq-atten0": ("iq", {"decimation": 8, "center": 1e9, "short": True, "atten": 0},
                   "Fixed 0 dB attenuation instead of auto, in case auto is "
                   "parking the attenuator somewhere odd."),
@@ -340,6 +368,44 @@ EXPERIMENTS = {
                          "queue_ms": 5.24},
                   "Exercises retune and the semaphore teardown path."),
 }
+
+
+def ab_verdict(experiments):
+    """Read the repair-on and repair-off A/B and state what it means, in words.
+
+    Returns a sentence, or None if the pair was not run. Nothing here is
+    inferred beyond the two results in front of it."""
+    by = {e["name"]: e for e in experiments}
+    on, off = by.get("iq-ab-repair-on"), by.get("iq-ab-repair-off")
+    if not on or not off or "result" not in on or "result" not in off:
+        return None
+    ron, roff = on["result"], off["result"]
+
+    def summary(r):
+        if not r.get("captured_samples"):
+            return "no data (" + str(r.get("getiq_error") or r.get("error")
+                                     or "nothing captured") + ")"
+        return f"{r.get('output_nonzero_pct', 0)}% non-zero"
+
+    non_on = ron.get("captured_samples") and ron.get("output_nonzero_pct", 0) > 0.5
+    non_off = roff.get("captured_samples") and roff.get("output_nonzero_pct", 0) > 0.5
+    line = f"repair on: {summary(ron)}; repair off: {summary(roff)}. "
+    if not ron.get("captured_samples") and not roff.get("captured_samples"):
+        line += ("Neither captured data, so this says nothing about the filters; "
+                 "look at the status trace for why.")
+    elif non_on and not non_off:
+        line += ("Repaired samples are real and the raw ones are zeros: the "
+                 "impulse filters are the cause and the repair is the fix.")
+    elif non_on and non_off:
+        line += ("Both are non-zero, so samples do not depend on the repair; the "
+                 "zeros seen elsewhere have another cause.")
+    elif not non_on and non_off:
+        line += "Unexpected: the repair produced zeros where the raw upload did not."
+    else:
+        line += ("Both are zeros with data flowing, so the impulse filters are "
+                 "not the only problem; the setup path needs comparing against "
+                 "the Linux build.")
+    return line
 
 
 def device_state(api, dev, lib, trace):
@@ -410,7 +476,9 @@ const R = REPORT_JSON;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 document.getElementById('meta').textContent =
   `${R.device.device_type||'?'} serial ${R.device.serial||'?'} · firmware ${R.device.firmware||'?'} · API ${R.device.api_version||'?'} · ${R.started}`;
-let h = '<h2>Device state</h2><table><tr><th>field</th><th>value</th></tr>';
+let h = '';
+if (R.ab_verdict) h += `<h2>Filter A/B</h2><div class="${/are the cause|are real/.test(R.ab_verdict)?'ok':(/another cause|not the only|Unexpected/.test(R.ab_verdict)?'warn':'')}">${esc(R.ab_verdict)}</div>`;
+h += '<h2>Device state</h2><table><tr><th>field</th><th>value</th></tr>';
 for (const [k,v] of Object.entries(R.device)) h += `<tr><td>${esc(k)}</td><td>${esc(JSON.stringify(v))}</td></tr>`;
 h += '</table><h2>Connection-lost status during setup</h2>'
   + '<div class=dim>-6 means a transfer or command failed. The library never clears it on its own, '
@@ -424,7 +492,8 @@ h += '<h2>Experiments</h2><table><tr><th>name</th><th>verdict</th><th>rate</th><
 for (const e of R.experiments) {
   const r = e.result || {};
   let verdict = 'ran', cls = '';
-  if (e.error || r.error) { verdict = 'failed'; cls = 'bad'; }
+  if (e.skipped) { verdict = 'skipped: ' + e.skipped; cls = 'dim'; }
+  else if (e.error || r.error) { verdict = 'failed'; cls = 'bad'; }
   else if (e.kind === 'iq' && !r.captured_samples) {
     verdict = 'no data: ' + (r.getiq_error || 'nothing captured'); cls = 'bad';
   }
@@ -456,7 +525,7 @@ document.getElementById('body').innerHTML = h;
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("dylib")
+    ap.add_argument("dylib", nargs="?")
     ap.add_argument("--host", default="192.168.2.2")
     ap.add_argument("--device", default="192.168.2.10")
     ap.add_argument("--port", type=int, default=51665)
@@ -474,8 +543,11 @@ def main():
 
     if args.list:
         for name, (kind, cfg, why) in EXPERIMENTS.items():
-            print(f"{name:18} [{kind}] {why}")
+            tag = " [native only]" if cfg.get("native_only") else ""
+            print(f"{name:18} [{kind}]{tag} {why}")
         return
+    if not args.dylib:
+        ap.error("dylib is required unless using --list")
 
     names = list(EXPERIMENTS)
     if args.only:
@@ -546,8 +618,18 @@ def main():
         print(f"\n! the connection-lost status was set during {stuck}")
     print(json.dumps(report["device"], indent=2))
 
+    explicit = set(names) if (args.only or args.interactive) else set()
     for name in names:
         kind, cfg, why = EXPERIMENTS[name]
+        # Native-only experiments need the C backend, so they fail on the Python
+        # transport by design. Skip them in a broad run; run them only when named.
+        if cfg.get("native_only") and name not in explicit:
+            print(f"\n--- {name} ({kind}) --- skipped (native backend only; "
+                  f"name it explicitly with --only to force)")
+            report["experiments"].append(
+                {"name": name, "kind": kind, "config": dict(cfg), "why": why,
+                 "skipped": "native backend only"})
+            continue
         print(f"\n--- {name} ({kind}) ---")
         entry = {"name": name, "kind": kind, "config": dict(cfg), "why": why}
         # Each experiment starts clean. A status left at -6 by an earlier one
@@ -597,7 +679,11 @@ def main():
         if head:
             print(f"  head {head[:72]}")
         report["experiments"].append(entry)
-    report["filter_repair"] = transport.filter_tables is not None
+
+    report["ab_verdict"] = ab_verdict(report["experiments"])
+    if report["ab_verdict"]:
+        print("\n=== filter A/B ===\n  " + report["ab_verdict"])
+    report["filter_repair"] = transport.shipped_tables is not None
 
     report["api_errors"] = api.log
     api("smAbort", dev)

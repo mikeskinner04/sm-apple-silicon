@@ -232,8 +232,13 @@ class Transport:
     def __init__(self, filter_tables=None):
         self.by_this = {}
         # Signal Hound's shipped decimation filter coefficients, used to repair
-        # the impulse uploads the macOS build sends. None disables repair.
+        # the impulse uploads the macOS build sends. filter_tables is the live
+        # setting: setting it to None disables repair, and callers may flip it
+        # per experiment. shipped_tables keeps the loaded set regardless, so a
+        # caller can tell "repair is off right now" from "no tables were ever
+        # loaded".
         self.filter_tables = filter_tables
+        self.shipped_tables = filter_tables
 
     def state(self, this):
         st = self.by_this.get(this)

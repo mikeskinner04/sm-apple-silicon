@@ -392,6 +392,8 @@ def main():
                 "sample_rate": rate.value, "bandwidth": bw.value,
                 "center_hz": actual.value, "decimation": args.decimation,
                 "iq_correction": scale.value,
+                "filter_repair_requested": not args.no_filter_repair,
+                "backend": "native" if native is not None else "python",
                 "note": "16-bit samples need multiplying by iq_correction" if args.short else "",
                 **result,
                 "transport": delta,
