@@ -136,9 +136,17 @@ single 1.0 at the centre: a unit impulse rather than a low-pass. After
 bits where real filters need 17. Sweep uses a different upload path, which is
 why sweeps work and I/Q does not. The Linux builds write these stages from
 constant tables; `sm_filters.py` extracts them from your copy and both backends
-substitute them into outgoing command packets. On hardware the uploads have now
-been seen leaving the library as impulses and being replaced. Whether that
-yields real samples is the next thing to confirm.
+substitute them into outgoing command packets. **Confirmed on hardware**: with
+repair on the device returns real samples, with it off exact zeros, same
+session, same settings.
+
+A second fault showed up once samples flowed: part way through one experiment
+the transfer boundaries slipped, and every later read returned "Data
+synchronization error". The cause is surplus datagrams sitting in front of
+every later transfer. Both transports now discard unrequested datagrams
+whenever nothing is armed, and resynchronise mid-stream on the aux block that
+ends every transfer, so a slip costs about one transfer rather than the rest of
+the session. See `docs/findings.md`.
 
 The first diagnostics runs could not show that. The harness ran
 `smNetworkedSpeedTest` before its experiments, the speed test always fails on

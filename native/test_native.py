@@ -17,12 +17,16 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from sm_native import Stats  # noqa: E402  one definition of the struct
 
 PAYLOAD = 8192
+AUX_MAGIC = b"4XU1"
+SURPLUS = 0xFFFFFFF0
+SLOTS_SPARE = 31              # a slot the streams below never use
 # Host and simulated device need different addresses on loopback, since both
 # bind the same port. On the real link they are different machines anyway.
 HOST_ADDR, DEV_ADDR, PORT = "127.0.0.1", "127.0.0.2", 51700
@@ -109,14 +113,20 @@ class Owner:
         raw = ctypes.string_at(self.lib.smn_data(self.ptr, slot), n * PAYLOAD)
         pos = []
         for j in range(n):
-            w0, inv = struct.unpack_from("<I", raw, j * PAYLOAD)[0], \
-                struct.unpack_from("<I", raw, j * PAYLOAD + PAYLOAD - 4)[0]
-            if w0 == 0 and inv == 0:
+            w1 = struct.unpack_from("<I", raw, j * PAYLOAD + 4)[0]
+            inv = struct.unpack_from("<I", raw, j * PAYLOAD + PAYLOAD - 4)[0]
+            if w1 == 0 and inv == 0:
                 pos.append(None)                     # zero-filled hole
             else:
-                assert w0 ^ inv == 0xFFFFFFFF, "corrupt payload"
-                pos.append(w0 - 1)                   # true stream position
-        return got, to, pos
+                assert w1 ^ inv == 0xFFFFFFFF, "corrupt payload"
+                pos.append("surplus" if w1 == SURPLUS else w1 - 1)
+        aux_ok = n < 32 or raw[(n - 1) * PAYLOAD:(n - 1) * PAYLOAD + 4] == AUX_MAGIC
+        return got, to, pos, aux_ok
+
+    def send_cmd(self, words):
+        cmd = ctypes.create_string_buffer(
+            struct.pack(f"<{len(words)}I", *words) + b"\0" * (2048 - 4 * len(words)), 2048)
+        self.lib.smn_begin_cmd(self.ptr, SLOTS_SPARE, cmd)
 
     def close(self):
         self.lib.smn_deallocate(self.ptr)
@@ -141,13 +151,16 @@ def stream(owner, n, count, depth=8):
     return out
 
 
-def exact(results, n, dropped=lambda p: False):
-    """Every slot must hold position base+j, or a hole exactly where the
-    simulator dropped. Returns (ok, holes)."""
+def exact(results, n, dropped=lambda p: False, start=0, skip=()):
+    """Every slot must hold position start+k*n+j, or a hole exactly where the
+    simulator dropped. Transfers listed in skip are not checked. Returns
+    (ok, holes)."""
     holes = 0
-    for k, (_, _, pos) in enumerate(results):
+    for k, (_, _, pos, _) in enumerate(results):
+        if k in skip:
+            continue
         for j, p in enumerate(pos):
-            want = k * n + j
+            want = start + k * n + j
             if p is None:
                 if not dropped(want):
                     return False, holes
@@ -205,8 +218,10 @@ def main():
     def clean(r, st):
         ok, holes = exact(r, 256)
         good = ok and holes == 0 and st["lost"] == 0 and st["resets"] == 0 \
-            and all(g == full and not t for g, t, _ in r)
-        return good, f"{len(r)} transfers exact across the wrap, lost {st['lost']}"
+            and all(g == full and not t for g, t, _, _ in r) and all(a for *_, a in r) \
+            and st["aux_misframed"] == 0 and st["resyncs"] == 0
+        return good, (f"{len(r)} transfers exact across the wrap, lost {st['lost']}, "
+                      f"every aux block in its slot")
     fails += run_case(lib, "clean, counter wraps mid-transfer", 256, 48, clean,
                       seq_start=0xFF80)
 
@@ -215,7 +230,7 @@ def main():
         ok, holes = exact(r, 256, dropped=lambda p: p % 97 == 96)
         aux = sum(1 for p in range(256 * len(r)) if p % 97 == 96 and p % 256 == 255)
         good = ok and holes == st["lost"] > 0 and st["aux_lost"] == aux \
-            and st["timeouts"] == 0 and all(g == full and not t for g, t, _ in r)
+            and st["timeouts"] == 0 and all(g == full and not t for g, t, _, _ in r)
         return good, (f"lost {st['lost']} as {holes} holes in place, aux lost "
                       f"{st['aux_lost']}, every transfer reported complete")
     fails += run_case(lib, "loss zero-filled in place", 256, 48, loss,
@@ -224,7 +239,7 @@ def main():
     # every 128th dropped: half the losses are the aux datagram at the end
     def aux(r, st):
         ok, holes = exact(r, 256, dropped=lambda p: p % 128 == 127)
-        return ok and st["aux_lost"] == len(r) and all(g == full for g, _, _ in r), \
+        return ok and st["aux_lost"] == len(r) and all(g == full for g, _, _, _ in r), \
             f"aux lost {st['aux_lost']} of {len(r)}, placement exact"
     fails += run_case(lib, "aux datagram lost", 256, 16, aux, drop_every=128)
 
@@ -256,12 +271,52 @@ def main():
     # small (calibration-sized) transfers keep strict reporting
     def strict(r, st):
         ok, holes = exact(r, 4, dropped=lambda p: p % 3 == 2)
-        honest = all(g == sum(p is not None for p in pos) * PAYLOAD for g, _, pos in r)
-        shorts = sum(g < 4 * PAYLOAD for g, _, _ in r)
+        honest = all(g == sum(p is not None for p in pos) * PAYLOAD for g, _, pos, _ in r)
+        shorts = sum(g < 4 * PAYLOAD for g, _, _, _ in r)
         return ok and honest and shorts == len(r), \
             f"{shorts} of {len(r)} damaged reads reported short, as the open expects"
     fails += run_case(lib, "small transfers stay strict", 4, 6, strict,
                       drop_every=3)
+
+    # One surplus datagram mid-stream, with a fresh counter value, as unrequested
+    # traffic would have. It lands in transfer 2 and pushes that transfer's aux
+    # block into transfer 3, where it arrives first. The resync discards it and
+    # from transfer 3 on every datagram is back at its true position.
+    def surplus1(r, st):
+        ok, _ = exact(r, 256, skip={2})
+        return ok and st["resyncs"] == 1 and st["resync_dropped"] == 1 \
+            and st["aux_misframed"] == 1 and all(a for *_, a in r[3:]), \
+            (f"resyncs {st['resyncs']}, dropped {st['resync_dropped']}, misframed "
+             f"{st['aux_misframed']}; transfers 3 on exact with aux in place")
+    fails += run_case(lib, "surplus of 1 resyncs", 256, 12, surplus1,
+                      surplus_after=700)
+
+    def surplus3(r, st):
+        ok, _ = exact(r, 256, skip={2})
+        return ok and st["resyncs"] == 1 and st["resync_dropped"] == 3 \
+            and all(a for *_, a in r[3:]), \
+            f"resyncs {st['resyncs']}, dropped {st['resync_dropped']}; later transfers exact"
+    fails += run_case(lib, "surplus of 3 resyncs", 256, 12, surplus3,
+                      surplus_after=700, surplus_count=3)
+
+    # Unrequested datagrams arriving between two streams are flushed when the
+    # next stream arms its first transfer, instead of shifting all of it.
+    sim = Sim()
+    owner = Owner(lib)
+    first = stream(owner, 256, 4)
+    owner.send_cmd([0x7E570003, 5])
+    time.sleep(0.3)
+    second = stream(owner, 256, 4)
+    st = stats(lib, owner.ptr)
+    owner.close()
+    sim.stop()
+    ok1, _ = exact(first, 256)
+    ok2, _ = exact(second, 256, start=4 * 256)
+    fails += report("stale datagrams flushed at idle",
+                    ok1 and ok2 and st["stale_flushed"] == 5 and st["lost"] == 0
+                    and st["aux_misframed"] == 0 and all(a for *_, a in second),
+                    f"flushed {st['stale_flushed']}, lost {st['lost']}, second stream "
+                    f"exact  [{sim.summary}]")
 
     # silence on a stream transfer: reported as a timeout
     sim = Sim()

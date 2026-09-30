@@ -58,7 +58,10 @@ MAX_LOGGED_COMMANDS = 400
 MAX_LOGGED_AUX = 8
 
 COUNTERS = ("calls", "datagrams", "payload_bytes", "nonzero_calls", "scanned_calls",
-            "zero_bytes", "scanned_bytes", "gaps", "lost", "resets")
+            "zero_bytes", "scanned_bytes", "gaps", "lost", "resets", "duplicates",
+            "stale_flushed", "aux_misframed", "resyncs", "resync_dropped")
+AUX_MAGIC = b"4XU1"         # every stream transfer's last datagram starts with this
+STREAM_MIN_MSGS = 32        # smallest I/Q stream transfer: 256 KB
 
 
 def got_slots(path, wanted):
@@ -251,6 +254,13 @@ class Transport:
                 "views": [memoryview(b).cast("B") for b in buffers],
                 "requested": [0] * SLOTS,
                 "timed_out": [False] * SLOTS,
+                "armed": [False] * SLOTS,
+                "scratch": bytearray(PAYLOAD_BYTES),
+                "duplicates": 0,
+                "stale_flushed": 0,
+                "aux_misframed": 0,
+                "resyncs": 0,
+                "resync_dropped": 0,
                 "cmd_sent": [0] * SLOTS,
                 "headers": [],
                 "last_seq": None,
@@ -376,15 +386,51 @@ class Transport:
 
     def begin_data(self, this, idx, length, arg3):
         st = self.state(this)
+        # The library arms before it requests, so with nothing else armed any
+        # datagram already waiting was never asked for. Reading it into this
+        # transfer would shift every later boundary: that is what produced a
+        # run of "Data synchronization error". Discard it first.
+        if length >= PAYLOAD_BYTES and not any(st["armed"]) and st["sock"]:
+            self.flush_stale(st)
         st["requested"][idx] = length
         st["timed_out"][idx] = False
+        st["armed"][idx] = length >= PAYLOAD_BYTES
+
+    def flush_stale(self, st):
+        sock, hdr, n, first, last = st["sock"], bytearray(HDR_BYTES), 0, None, None
+        sock.setblocking(False)
+        try:
+            while True:
+                try:
+                    sock.recvmsg_into([hdr, st["scratch"]])
+                except (BlockingIOError, InterruptedError):
+                    break
+                seq = int.from_bytes(hdr[:4], "little")
+                first = seq if first is None else first
+                last = seq
+                n += 1
+        finally:
+            sock.settimeout(RCVTIMEO)
+        if n:
+            st["stale_flushed"] += n
+            st["last_seq"] = last            # carry continuity through them
+            self.event(st, "stale_flushed", datagrams=n,
+                       first_header=f"{first:#010x}", last_header=f"{last:#010x}")
 
     def begin_data_buf(self, this, idx, buf, length, arg3):
         self.begin_data(this, idx, length, arg3)
 
     def finish_data(self, this, idx):
-        """Scatter each datagram: 8-byte header aside, 8192-byte payload inline."""
+        """Scatter each datagram: 8-byte header aside, 8192-byte payload inline.
+
+        For stream transfers the aux block is the device's end-of-transfer
+        mark. If one arrives before the last slot, the boundaries have slipped:
+        what came before it belongs to the previous transfer, so discard it and
+        fill this transfer afresh. A slip then costs one transfer rather than
+        every transfer after it.
+        """
         st = self.state(this)
+        st["armed"][idx] = False
         want = st["requested"][idx]
         nmsgs = want // PAYLOAD_BYTES
         if nmsgs < 1:
@@ -392,39 +438,66 @@ class Transport:
 
         mv = st["views"][idx]
         hdr = bytearray(HDR_BYTES)
+        stream = nmsgs >= STREAM_MIN_MSGS
         got = 0
+        seqs = []
         st["calls"] += 1
         if len(st["req_seen"]) < 8:
             st["req_seen"].add(want)
         if want > MAX_MSGS * PAYLOAD_BYTES:
             print(f"  ! transfer of {want} exceeds the {MAX_MSGS * PAYLOAD_BYTES} "
                   f"byte slot buffer")
-        for i in range(nmsgs):
-            view = mv[i * PAYLOAD_BYTES:(i + 1) * PAYLOAD_BYTES]
+        pos = 0
+        while pos < nmsgs:
+            view = mv[pos * PAYLOAD_BYTES:(pos + 1) * PAYLOAD_BYTES]
             try:
                 nbytes, _, _, _ = st["sock"].recvmsg_into([hdr, view])
             except OSError as e:
-                print(f"  ! recv timeout/error on slot {idx} after {i} msgs: {e}")
+                print(f"  ! recv timeout/error on slot {idx} after {pos} msgs: {e}")
                 st["timed_out"][idx] = True
                 self.event(st, "recv_failed", slot=idx, requested=want,
-                           datagrams_wanted=nmsgs, datagrams_got=i, error=str(e))
+                           datagrams_wanted=nmsgs, datagrams_got=pos, error=str(e))
                 break
             if len(st["headers"]) < 32:
                 st["headers"].append(bytes(hdr))
             seq = int.from_bytes(hdr[:4], "little")
             last = st["last_seq"]
-            if last is not None and seq != (last + 1) & 0xFFFFFFFF:
-                if seq < last:
-                    st["resets"] += 1        # counter restarted, not loss
-                else:
+            if last is not None:
+                d = (seq - last) & 0xFFFF          # the counter is 16 bits wide
+                if d == 0:
+                    st["duplicates"] += 1
+                elif d >= 0x8000:
+                    st["resets"] += 1              # behind: restart or straggler
+                elif d > 1:
                     st["gaps"] += 1
-                    st["lost"] += seq - last - 1
+                    st["lost"] += d - 1
             st["last_seq"] = seq
             st["datagrams"] += 1
             st["payload_bytes"] += max(0, nbytes - HDR_BYTES)
             if nbytes != HDR_BYTES + PAYLOAD_BYTES:
                 print(f"  ! short datagram: {nbytes} bytes")
+                self.event(st, "short_datagram", slot=idx, bytes=nbytes,
+                           header=bytes(hdr).hex())
+            if len(seqs) < 300:
+                seqs.append(seq & 0xFFFF)
+            if stream and pos < nmsgs - 1 and view[:4] == AUX_MAGIC:
+                st["resyncs"] += 1
+                st["resync_dropped"] += pos + 1
+                self.event(st, "resync", slot=idx, aux_at=pos, of=nmsgs,
+                           seqs=seqs[-8:])
+                pos, got = 0, 0
+                continue
             got += max(0, nbytes - HDR_BYTES)
+            pos += 1
+
+        if stream and pos == nmsgs and mv[(nmsgs - 1) * PAYLOAD_BYTES:
+                                          (nmsgs - 1) * PAYLOAD_BYTES + 4] != AUX_MAGIC:
+            st["aux_misframed"] += 1
+            if st["aux_misframed"] <= 3:
+                self.event(st, "misframed", slot=idx, transfer=st["calls"],
+                           seqs_first=seqs[:4], seqs_last=seqs[-4:],
+                           contiguous=all((b - a) & 0xFFFF == 1
+                                          for a, b in zip(seqs, seqs[1:])))
 
         # Every hundredth transfer, measure the whole thing rather than a corner
         # of it. bytes().count() runs at C speed, so this costs almost nothing.

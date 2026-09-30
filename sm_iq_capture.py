@@ -39,6 +39,7 @@ smModeIdle, smModeIQStreaming = 0, 3
 smIQStreamSampleRateNative = 0
 smFalse, smTrue = 0, 1
 NETWORKED_BASE_RATE = 200e6
+SM_SYNC_ERR = -11              # smSyncErr: an aux block was not where expected
 TRANSFER_MS = 2.62144          # one request; the queue is 2 to 16 of these
 SAMPLES_PER_DATAGRAM = 2048    # 8192-byte payload of 16-bit complex
 
@@ -128,7 +129,8 @@ def transport_counters(native, transport):
         return N.stats(native).as_dict()
     totals = {}
     for st in transport.by_this.values():
-        for k in ("datagrams", "lost", "gaps", "resets"):
+        for k in ("datagrams", "lost", "gaps", "resets", "duplicates", "stale_flushed",
+                  "aux_misframed", "resyncs", "resync_dropped"):
             totals[k] = totals.get(k, 0) + st[k]
     return totals
 
@@ -201,7 +203,7 @@ def capture(lib, dev, out, total, rate, bytes_per_sample, discard):
     w.start()
     ns, first_ns = ctypes.c_int64(), None
     loss, remaining = ctypes.c_int(), ctypes.c_int()
-    captured = flags = max_backlog = 0
+    captured = flags = max_backlog = sync_flags = 0
     started = time.monotonic()
     try:
         while captured < total and not failure:
@@ -210,7 +212,11 @@ def capture(lib, dev, out, total, rate, bytes_per_sample, discard):
             status = lib.smGetIQ(dev, buf, n, None, 0, ctypes.byref(ns),
                                  smTrue if captured == 0 else smFalse,
                                  ctypes.byref(loss), ctypes.byref(remaining))
-            if status < 0:
+            if status == SM_SYNC_ERR:
+                # The samples were copied before the sync check: keep them and
+                # count the flag. The transport's framing counters say why.
+                sync_flags += 1
+            elif status < 0:
                 free.put(buf)
                 print(f"  smGetIQ: {status} ({lib.smGetErrorString(status).decode()})")
                 break
@@ -227,6 +233,7 @@ def capture(lib, dev, out, total, rate, bytes_per_sample, discard):
         print(f"  write failed: {failure[0]}")
     return {"samples": captured, "seconds": time.monotonic() - started,
             "first_sample_ns": first_ns, "library_loss_flags": flags,
+            "sync_flags": sync_flags,
             "max_backlog_ms": 1e3 * max_backlog / rate}
 
 
@@ -374,6 +381,13 @@ def main():
                             f"as sample loss (requests fell behind)")
         if delta.get("resets"):
             problems.append(f"{delta['resets']} counter restarts")
+        if delta.get("aux_misframed") or delta.get("resyncs"):
+            problems.append(f"{delta.get('aux_misframed', 0)} transfers out of frame, "
+                            f"{delta.get('resyncs', 0)} resynchronised: extra datagrams "
+                            f"arrived; about one transfer of samples is suspect per event")
+        if result["sync_flags"]:
+            problems.append(f"{result['sync_flags']} reads flagged a sync error "
+                            f"(samples kept)")
         status_out = status.read(dev)
         if status_out:
             problems.append(f"connection-lost status set to {status_out} during the capture: "
@@ -382,6 +396,9 @@ def main():
             span = sum(h[1] for h in holes)
             problems.append(f"{len(holes)} zero-filled holes, {span} samples, "
                             f"positions in the sidecar")
+        if delta.get("stale_flushed"):
+            print(f"  note: {delta['stale_flushed']} unrequested datagrams were discarded "
+                  f"before the stream started")
         print("  clean: no loss anywhere" if not problems else
               "  DATA LOSS:\n    " + "\n    ".join(problems))
 

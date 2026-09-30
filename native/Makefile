@@ -20,6 +20,7 @@ sm_sim: sm_sim.c
 
 test: all
 	python3 test_native.py
+	python3 test_transport.py
 
 clean:
 	rm -f libsmnative.so libsmnative.dylib sm_sim

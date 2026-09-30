@@ -41,6 +41,14 @@
  * the original strict behaviour so a damaged read fails the open rather than
  * loading bad calibration.
  *
+ * Framing
+ *
+ * Every stream transfer ends with an aux block starting "4XU1", and the
+ * library raises smSyncErr on any transfer without one there. If surplus
+ * datagrams ever slip the boundaries, two defences restore them: unrequested
+ * datagrams are flushed whenever nothing is armed, and an aux block arriving
+ * before the last slot resets the transfer at it. See docs/findings.md.
+ *
  * Every method below has the ABI of the C++ virtual it replaces: `this` arrives
  * as the first argument, exactly as a plain C function receives it on arm64.
  *
@@ -89,6 +97,9 @@
 #define STREAM_MIN_MSGS 32     /* smallest I/Q stream transfer: 256 KB at hardware decimation 8 */
 #define SEQ_WINDOW   32        /* transfers; a jump beyond this many is a counter restart */
 #define STRAY_RUN    8         /* this many consecutive stale datagrams is also a restart */
+/* Every stream transfer ends with an aux block that starts with this magic,
+ * "4XU1". SmDevice::UpdateAuxData checks it and raises smSyncErr without it. */
+static const uint8_t AUX_MAGIC[4] = {0x34, 0x58, 0x55, 0x31};
 #define LIB_PRIORITY 47        /* timeshare priority for library threads, as user-interactive QoS */
 
 typedef struct {
@@ -107,6 +118,11 @@ typedef struct {
 	uint64_t aux_lost;         /* stream transfers whose final (aux) datagram was lost */
 	uint64_t queue_empty;      /* stream transfer completed with nothing else armed */
 	uint64_t lib_promotions;   /* library threads moved to LIB_PRIORITY (macOS) */
+	uint64_t stale_flushed;    /* unrequested datagrams discarded while nothing was armed */
+	uint64_t aux_misframed;    /* stream transfers whose last datagram was not an aux block */
+	uint64_t resyncs;          /* aux block arrived early; framing restored at it */
+	uint64_t resync_dropped;   /* datagrams discarded by those resyncs */
+	uint64_t first_misframe;   /* transfer number of the first misframe, 0 if none */
 	uint64_t max_outstanding;  /* armed transfers waiting, high water */
 	int32_t rcvbuf;            /* negotiated SO_RCVBUF */
 	int32_t rx_sched;          /* receiver thread: 2 real-time, 1 user-interactive QoS, 0 default */
@@ -266,12 +282,33 @@ static int accept_dgram(iface_t *f, xfer_t *x, uint16_t seq, const uint8_t *data
 	x->next_idx = idx + 1;
 	f->st.datagrams++;
 	f->st.payload_bytes += PAYLOAD;
+
+	/* An aux block anywhere but the last slot marks where the device's transfer
+	 * really ended: something upstream added datagrams, so our boundaries have
+	 * slipped. Everything placed so far in this transfer belongs to the
+	 * previous one, whose aux slot was already handed over, so discard it and
+	 * start this transfer afresh at the next datagram. The count of datagrams
+	 * delivered then matches the device again, so later sample positions are
+	 * right; the damage is limited to the transfer where the slip happened. */
+	if (x->n >= STREAM_MIN_MSGS && idx < x->n - 1 && memcmp(dst, AUX_MAGIC, 4) == 0) {
+		f->st.resyncs++;
+		f->st.resync_dropped += (uint64_t)(idx + 1);
+		x->base = (uint16_t)(seq + 1);
+		x->next_idx = 0;
+		x->placed = 0;
+	}
 	return 0;
 }
 
 static void complete_xfer(iface_t *f, xfer_t *x, bool timed_out)
 {
 	bool stream = x->n >= STREAM_MIN_MSGS;
+	if (stream && x->next_idx >= x->n &&
+	    memcmp(x->buf + (size_t)(x->n - 1) * PAYLOAD, AUX_MAGIC, 4) != 0) {
+		f->st.aux_misframed++;
+		if (!f->st.first_misframe)
+			f->st.first_misframe = f->st.transfers + 1;
+	}
 	if (x->next_idx < x->n) {
 		uint32_t missing = (uint32_t)(x->n - x->next_idx);
 		memset(x->buf + (size_t)x->next_idx * PAYLOAD, 0, (size_t)missing * PAYLOAD);
@@ -613,6 +650,42 @@ int smn_finish_cmd(void *self, int idx)
 	return n;
 }
 
+/* Called with f->mu held and nothing armed, so the receiver thread is parked
+ * and cannot be in recvmsg. The library always arms a transfer before sending
+ * the request for it, so any datagram already waiting now was never asked
+ * for: left over from an abandoned transfer, or surplus from upstream. Reading
+ * it into the next transfer would shift every boundary after it, which is what
+ * produces a run of smSyncErr. Discard it, and carry the sequence continuity
+ * through it so the next transfer does not see a false gap. */
+static void flush_stale(iface_t *f)
+{
+	uint8_t hdr[HDR_BYTES], junk[PAYLOAD];
+	uint64_t n = 0;
+	uint16_t last = 0;
+	if (f->carry.valid) {
+		last = f->carry.seq;
+		f->carry.valid = false;
+		n++;
+	}
+	for (;;) {
+		struct iovec iov[2] = {{hdr, HDR_BYTES}, {junk, PAYLOAD}};
+		struct msghdr mh;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = iov;
+		mh.msg_iovlen = 2;
+		if (recvmsg(f->sock, &mh, MSG_DONTWAIT) < 0)
+			break;
+		last = (uint16_t)le32(hdr);
+		n++;
+	}
+	if (n) {
+		f->st.stale_flushed += n;
+		f->next_seq = (uint16_t)(last + 1);
+		f->have_next = true;
+		f->stray_run = 0;
+	}
+}
+
 void smn_begin_data(void *self, int idx, int len, int arg3)
 {
 	(void)arg3;
@@ -623,6 +696,8 @@ void smn_begin_data(void *self, int idx, int len, int arg3)
 	if (n > MAX_MSGS)
 		n = MAX_MSGS;                        /* the original's buffers are this size too */
 	pthread_mutex_lock(&f->mu);
+	if (n > 0 && f->fifo_head == f->fifo_tail && f->rx_started && f->sock >= 0)
+		flush_stale(f);
 	f->requested[idx] = len;
 	f->nmsgs[idx] = n;
 	f->received[idx] = 0;
@@ -860,4 +935,4 @@ void smn_get_stats(void *owner, smn_stats_t *out)
 }
 
 int smn_stats_size(void) { return (int)sizeof(smn_stats_t); }
-const char *smn_version(void) { return "sm_native 1.1"; }
+const char *smn_version(void) { return "sm_native 1.2"; }

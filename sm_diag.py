@@ -14,6 +14,7 @@ Every experiment is isolated: a failure is recorded and the run carries on.
 """
 
 import argparse
+import array
 import ctypes
 import json
 import os
@@ -36,6 +37,7 @@ smScaleLog = 0
 smVideoLog = 0
 smWindowFlatTop = 0
 smSweepSpeedAuto, smSweepSpeedNormal, smSweepSpeedFast = 0, 1, 2
+SM_SYNC_ERR = -11             # smSyncErr: aux block missing where expected
 NETWORKED_BASE_RATE = 200e6
 DEVICE_TYPES = {0: "SM200A", 1: "SM200B", 2: "SM200C", 3: "SM435B", 4: "SM435C"}
 
@@ -212,11 +214,11 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
                   center_actual=actual.value, correction=scale.value)
 
     block = 32768
-    total = max(block, int(rate.value * seconds))
+    total = max(block, int(rate.value * cfg.get("seconds", seconds)))
     buf = ctypes.create_string_buffer(block * bps)
     ns, loss, remaining = ctypes.c_int64(), ctypes.c_int(), ctypes.c_int()
 
-    captured, losses, nonzero, first_ns = 0, 0, 0, None
+    captured, losses, nonzero, first_ns, sync_flags = 0, 0, 0, None, 0
     peak = 0.0
     keep = bytearray()
     t0 = time.monotonic()
@@ -226,7 +228,12 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
         status = api("smGetIQ", dev, buf, n, None, 0, ctypes.byref(ns),
                      smTrue if first else smFalse, ctypes.byref(loss),
                      ctypes.byref(remaining))
-        if status < 0:
+        if status == SM_SYNC_ERR:
+            # GetIQ copies the samples before it checks the sync flag, so they
+            # were delivered; the flag says the aux block of some transfer was
+            # not where it belonged. Count it and carry on.
+            sync_flags += 1
+        elif status < 0:
             result["getiq_error"] = api.err(status)
             break
         if first:
@@ -234,8 +241,9 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
         raw = buf.raw[:n * bps]
         nonzero += len(raw) - raw.count(0)
         if short:
-            vals = struct.unpack(f"<{n * 2}h", raw)
-            peak = max(peak, max(abs(v) for v in vals) if vals else 0)
+            vals = array.array("h", raw)       # max/min run in C, unlike a generator
+            if vals:
+                peak = max(peak, max(vals), -min(vals))
         if losses == 0 and len(keep) < keep_samples * bps:
             keep += raw[:keep_samples * bps - len(keep)]
         if loss.value:
@@ -249,6 +257,7 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
         elapsed_s=round(elapsed, 3),
         sustained_MSps=round(captured / elapsed / 1e6, 4) if elapsed else 0,
         sample_loss_flags=losses,
+        sync_flags=sync_flags,
         output_nonzero_bytes=nonzero,
         output_nonzero_pct=round(100.0 * nonzero / max(1, captured * bps), 4),
         first_timestamp_ns=first_ns,
@@ -367,6 +376,14 @@ EXPERIMENTS = {
     "iq-retune": ("iq", {"decimation": 8, "center": 1.5e9, "short": True,
                          "queue_ms": 5.24},
                   "Exercises retune and the semaphore teardown path."),
+    # The first framing slip on hardware began inside iq-atten0. Repeating it
+    # shows whether that setting provokes it or it was chance.
+    "iq-atten0-again": ("iq", {"decimation": 8, "center": 1e9, "short": True, "atten": 0},
+                        "Repeat of iq-atten0: is the framing slip reproducible?"),
+    # Ten times the usual dwell, to count how often slips happen at all. That
+    # rate decides whether long decimation-1 captures can be trusted.
+    "iq-soak": ("iq", {"decimation": 8, "center": 1e9, "short": True, "seconds": 5.0},
+                "Five-second stream: how often do framing slips occur?"),
 }
 
 
@@ -473,6 +490,14 @@ summary{cursor:pointer;font-weight:600} pre{overflow-x:auto;font-size:12px;color
 <div class=dim id=meta></div><div id=body></div>
 <script>
 const R = REPORT_JSON;
+const framing = (t, r) => {
+  const parts = [];
+  if (t.aux_misframed) parts.push(t.aux_misframed + ' misframed');
+  if (t.resyncs) parts.push(t.resyncs + ' resynced');
+  if (t.stale_flushed) parts.push(t.stale_flushed + ' stale flushed');
+  if (r.sync_flags) parts.push(r.sync_flags + ' sync-flagged');
+  return parts.length ? parts.join(', ') : (t.calls ? 'clean' : '&mdash;');
+};
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 document.getElementById('meta').textContent =
   `${R.device.device_type||'?'} serial ${R.device.serial||'?'} · firmware ${R.device.firmware||'?'} · API ${R.device.api_version||'?'} · ${R.started}`;
@@ -488,7 +513,7 @@ for (const t of (R.status_trace || [])) h += `<tr><td>${esc(t.after)}</td><td cl
 h += '</table>';
 const ev = [...((R.open_phase||{}).events||[]), ...((R.state_phase||{}).events||[])];
 if (ev.length) h += '<div class=bad>Transport failures during setup: ' + esc(JSON.stringify(ev)) + '</div>';
-h += '<h2>Experiments</h2><table><tr><th>name</th><th>verdict</th><th>rate</th><th>output non-zero</th><th>payload</th><th>loss</th><th>status in</th><th>status out</th></tr>';
+h += '<h2>Experiments</h2><table><tr><th>name</th><th>verdict</th><th>rate</th><th>output non-zero</th><th>payload</th><th>loss</th><th>framing</th><th>status in</th><th>status out</th></tr>';
 for (const e of R.experiments) {
   const r = e.result || {};
   let verdict = 'ran', cls = '';
@@ -496,6 +521,9 @@ for (const e of R.experiments) {
   else if (e.error || r.error) { verdict = 'failed'; cls = 'bad'; }
   else if (e.kind === 'iq' && !r.captured_samples) {
     verdict = 'no data: ' + (r.getiq_error || 'nothing captured'); cls = 'bad';
+  }
+  else if (e.kind === 'iq' && r.getiq_error) {
+    verdict = 'partial, then ' + r.getiq_error; cls = 'warn';
   }
   else if (e.kind === 'iq') {
     if (r.output_nonzero_pct > 0.5) { verdict = 'real samples'; cls = 'ok'; }
@@ -510,6 +538,7 @@ for (const e of R.experiments) {
     + `<td>${r.output_nonzero_pct!==undefined ? r.output_nonzero_pct+'%' : '&mdash;'}</td>`
     + `<td>${t.payload_bytes ? (t.payload_bytes/1e6).toFixed(1)+' MB' : '&mdash;'}</td>`
     + `<td>${r.sample_loss_flags!==undefined ? r.sample_loss_flags : '&mdash;'}</td>`
+    + `<td class=${(t.aux_misframed||r.sync_flags) ? 'warn' : ''}>${framing(t, r)}</td>`
     + `<td class=${e.status_in ? 'warn' : ''}>${e.status_in ?? '&mdash;'}</td>`
     + `<td class=${e.status_out ? 'bad' : ''}>${e.status_out ?? '&mdash;'}</td></tr>`;
 }
@@ -663,6 +692,8 @@ def main():
         head = r.get("sample_head", "")
         if kind == "iq" and not r.get("captured_samples"):
             verdict = f"NO DATA ({r.get('getiq_error') or r.get('error') or 'nothing captured'})"
+        elif kind == "iq" and r.get("getiq_error"):
+            verdict = f"PARTIAL, then {r['getiq_error']}"
         else:
             verdict = ("real samples" if r.get("output_nonzero_pct", 0) > 0.5
                        else "ZEROS" if kind == "iq" else "")
@@ -673,6 +704,10 @@ def main():
         if kind == "sweep":
             print(f"  peak {r.get('peak_dBm')} dBm at {r.get('peak_freq_Hz')} Hz, "
                   f"median {r.get('median_dBm')} dBm, flat={r.get('all_identical')}")
+        framing = {k: t.get(k, 0) for k in ("aux_misframed", "resyncs", "stale_flushed",
+                                              "duplicates") if t.get(k)}
+        if framing or r.get("sync_flags"):
+            print(f"  framing: {framing}  sync-flagged reads {r.get('sync_flags', 0)}")
         if t.get("filter_repairs"):
             stages = sorted({r["stage"] for r in t["filter_repairs"]})
             print(f"  repaired impulse filter uploads for stages {stages}")

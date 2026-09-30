@@ -118,7 +118,8 @@ def declare(native):
 STAT_U64 = ["datagrams", "payload_bytes", "lost", "gaps", "resets", "strays",
             "short_datagrams", "timeouts", "transfers", "short_transfers",
             "filter_repairs", "commands", "aux_lost", "queue_empty",
-            "lib_promotions", "max_outstanding"]
+            "lib_promotions", "stale_flushed", "aux_misframed", "resyncs",
+            "resync_dropped", "first_misframe", "max_outstanding"]
 STAT_I32 = ["rcvbuf", "rx_sched", "lib_policy_low", "lib_prio_low",
             "lib_policy_after", "lib_prio_after"]
 
