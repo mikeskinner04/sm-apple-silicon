@@ -47,9 +47,10 @@ Only `libsm_api`'s own GOT is touched, so the host process keeps its own
 semaphores.
 
 Every command packet passes through the replacement `BeginCommandXfer`, so the
-transport recognises `WriteIQFilter` uploads carrying an impulse and substitutes
-the shipped coefficients before the packet leaves. Uploads that already carry
-real coefficients pass through untouched, so a fixed future build is safe.
+transport recognises `WriteIQFilter` uploads carrying an impulse and replaces
+them, before the packet leaves, with the filter the Linux build would design
+for the device's current settings. Uploads that already carry real
+coefficients pass through untouched, so a fixed future build is safe.
 
 ## Build and run
 
@@ -62,17 +63,7 @@ That builds `sem_shim.dylib` for the Python backend and
 transport against a device simulator on loopback; see `docs/guide.md` for the
 one-off loopback alias it needs on macOS.
 
-Extract the decimation filter tables once, from the aarch64 or x86-64 Linux
-build shipped in the same SDK. They are Signal Hound's data, so they are read
-from your copy at setup time rather than stored here:
-
-```
-python3 sm_filters.py extract ./libsm_api.so.2.3.9
-```
-
-That writes `filter_tables.json`, which is ignored by git.
-
-Put `filter_tables.json` beside the scripts, then:
+Then:
 
 ```
 python3 sm_transport.py ./libsm_api.2.3.7.dylib 192.168.2.2 192.168.2.10 51665
@@ -134,11 +125,24 @@ programs four decimation filter stages in the device using
 single 1.0 at the centre: a unit impulse rather than a low-pass. After
 `WriteIQFilter` normalises and scales it, that centre coefficient needs 19 or 20
 bits where real filters need 17. Sweep uses a different upload path, which is
-why sweeps work and I/Q does not. The Linux builds write these stages from
-constant tables; `sm_filters.py` extracts them from your copy and both backends
-substitute them into outgoing command packets. **Confirmed on hardware**: with
-repair on the device returns real samples, with it off exact zeros, same
-session, same settings.
+why sweeps work and I/Q does not. **Confirmed on hardware**: with repair on the
+device returns real samples, with it off exact zeros, same session, same
+settings.
+
+The Linux builds design these stages at run time with the real
+`GetLowpassFIRTaps_64f`, and narrow the last stage in use to the requested
+bandwidth. `sm_filters.py` reproduces that design and its encoding bit for bit
+(`reference/check_design.py` checks it against the Linux library), and the
+repair reads the rate mode, decimation and bandwidth from the library's own
+`SmDevice`, at offsets decoded from its setters, so it follows whoever set
+them. The Linux builds also contain constant tables for these stages, which
+an earlier version of this repair substituted, but the streaming engine never
+sends them. They can still be extracted and selected with
+`--filter-repair tables` for comparison:
+
+```
+python3 sm_filters.py extract ./libsm_api.so.2.3.9    # writes filter_tables.json
+```
 
 A second fault showed up once samples flowed: part way through one experiment
 the transfer boundaries slipped, and every later read returned "Data
@@ -157,7 +161,7 @@ that status throughout; see `docs/findings.md`.
 
 To settle whether the filters are the cause, the harness runs a built-in A/B:
 `iq-ab-repair-on` and `iq-ab-repair-off`, the same settings with repair on then
-off, in one session. It prints a plain verdict comparing the two, so a single
+off, in one session, plus `iq-ab-repair-tables` with the constant tables. It prints a plain verdict comparing the two, so a single
 run answers the question rather than two runs into separate directories.
 
 Decimation 1 is built and tested offline, against a simulator that reproduces

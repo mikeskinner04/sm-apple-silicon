@@ -55,6 +55,7 @@ def load():
     lib.smn_repair_packet.argtypes = [v, i]
     lib.smn_repair_packet.restype = i
     lib.smn_set_filter_table.argtypes = [i, ctypes.POINTER(ctypes.c_double)]
+    lib.smn_set_repair_callback.argtypes = [v]
     lib.smn_set_timeout_ms.argtypes = [i]
     lib.smn_stats_size.restype = i
     lib.smn_get_stats.argtypes = [v, ctypes.POINTER(Stats)]
@@ -194,6 +195,40 @@ def test_filter_repair(lib):
     return fails
 
 
+REPAIR_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                             ctypes.POINTER(ctypes.c_uint32), ctypes.c_int)
+
+
+def test_repair_callback(lib):
+    """With a callback registered, only packets holding an impulse reach it,
+    with the right owner and length, and its return value is what is counted."""
+    calls = []
+
+    def repair(this, words, nwords):
+        calls.append((this, nwords, words[0]))
+        words[9 + 79] = 12345            # stand-in for the real coefficients
+        return 1
+
+    cb = REPAIR_CB(repair)
+    lib.smn_set_repair_callback(cb)
+    sim = Sim()
+    owner = Owner(lib)
+    try:
+        half = 80
+        impulse = [(0x04 << 24) | ((half + 8) << 16) | 0x778] + [0] * (8 + half - 1) + [1 << 18]
+        owner.send_cmd([0x04010001, 0x00000001])        # not a filter upload
+        owner.send_cmd(impulse)
+        st = stats(lib, owner.ptr)
+    finally:
+        owner.close()
+        sim.stop()
+        lib.smn_set_repair_callback(None)
+    ok = (len(calls) == 1 and calls[0][0] == owner.ptr and calls[0][1] == 512
+          and calls[0][2] == impulse[0] and st["filter_repairs"] == 1)
+    return report("repair callback", ok,
+                  f"called {len(calls)} time(s) for 2 packets, counted {st['filter_repairs']}")
+
+
 def run_case(lib, name, n, count, check, **sim_opts):
     sim = Sim(**sim_opts)
     owner = Owner(lib)
@@ -213,6 +248,7 @@ def main():
     lib.smn_set_timeout_ms(400)
     full = 256 * PAYLOAD
     fails = test_filter_repair(lib)
+    fails += test_repair_callback(lib)
 
     # 16-bit wrap in the middle of the first transfer, then clean streaming
     def clean(r, st):

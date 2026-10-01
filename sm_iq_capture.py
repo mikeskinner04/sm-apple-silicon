@@ -251,8 +251,11 @@ def main():
     ap.add_argument("--queue-ms", type=float, default=None,
                     help="smSetIQQueueSize; smaller means faster retunes")
     ap.add_argument("--short", action="store_true", help="16-bit complex instead of 32-bit float")
+    ap.add_argument("--filter-repair", choices=("design", "tables", "off"),
+                    default="design",
+                    help="what replaces the impulse filter uploads (default design)")
     ap.add_argument("--no-filter-repair", action="store_true",
-                    help="send the library's own filter uploads unmodified")
+                    help="same as --filter-repair off")
     ap.add_argument("--native", action="store_true",
                     help="use the native C backend (needed for decimation 1)")
     ap.add_argument("--discard", action="store_true",
@@ -263,19 +266,23 @@ def main():
                     help="single frequency writes here; several get a -<MHz> suffix")
     args = ap.parse_args()
     centers = [float(c) for c in args.center.split(",")]
+    if args.no_filter_repair:
+        args.filter_repair = "off"
 
     transport = native = None
     if args.native:
         import sm_native as N
-        lib, native = N.install(args.dylib, filter_repair=not args.no_filter_repair,
+        lib, native = N.install(args.dylib, filter_mode=args.filter_repair,
                                 promote=not args.no_promote)
+        repair = native.filter_repair
         bind(lib)
     else:
         addrs = T.symbol_addresses(args.dylib, {T.VTABLE_SYM, T.ANCHOR_SYM})
         lib = ctypes.CDLL(args.dylib)
         bind(lib)
         slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
-        transport = T.Transport(T.load_filter_tables(not args.no_filter_repair))
+        repair = T.load_filter_repair(args.dylib, slide, args.filter_repair)
+        transport = T.Transport(repair)
         T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
         shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
         if not os.path.exists(shim):
@@ -327,6 +334,7 @@ def main():
             print(f"  connection-lost status was stuck at {status_in} from an earlier "
                   f"failed transfer; cleared")
         tune_start = time.monotonic()
+        repairs_before = repair.seen
         check(lib, lib.smSetIQCenterFreq(dev, center), "smSetIQCenterFreq")
         check(lib, lib.smConfigure(dev, smModeIQStreaming), "smConfigure")
         tune_ms = (time.monotonic() - tune_start) * 1e3
@@ -341,6 +349,17 @@ def main():
         print(f"\ntuned to {actual.value/1e6:.6f} MHz in {tune_ms:.1f} ms")
         print(f"  {rate.value/1e6:.4f} MS/s, {bw.value/1e6:.3f} MHz bandwidth, "
               f"correction {scale.value:.6g}")
+        new = min(repair.seen - repairs_before, len(repair.log))
+        uploads = repair.log[-new:] if new else []
+        if uploads:
+            done = [r for r in uploads if r.get("repaired")]
+            if done:
+                print(f"  filters ({repair.mode}): " + ", ".join(
+                    f"stage {r['stage']} {r['fc']:.6f}" if "fc" in r else f"stage {r['stage']}"
+                    for r in done))
+            if len(done) < len(uploads):
+                print(f"  ! {len(uploads) - len(done)} impulse filter uploads not repaired: "
+                      f"{sorted({r.get('reason', '?') for r in uploads if not r.get('repaired')})}")
 
         if len(centers) == 1:
             out = args.out
@@ -409,7 +428,8 @@ def main():
                 "sample_rate": rate.value, "bandwidth": bw.value,
                 "center_hz": actual.value, "decimation": args.decimation,
                 "iq_correction": scale.value,
-                "filter_repair_requested": not args.no_filter_repair,
+                "filter_repair_mode": repair.mode,
+                "filter_repairs": [r for r in repair.log if r.get("repaired")][-4:],
                 "backend": "native" if native is not None else "python",
                 "note": "16-bit samples need multiplying by iq_correction" if args.short else "",
                 **result,

@@ -160,21 +160,29 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     """Configure I/Q streaming, pull samples, report what actually arrived.
 
     cfg["repair"], if present, overrides filter repair for this one experiment:
-    True forces it on, False forces it off. This is what lets an A/B pair run in
-    a single session. The transport reads filter_tables at packet time, so
-    flipping it here takes effect for this experiment's uploads and is restored
-    afterwards.
+    False forces it off, True keeps the session's mode, and "design" or
+    "tables" selects that source. This is what lets an A/B run in a single
+    session. The transport reads the mode at packet time, so changing it here
+    takes effect for this experiment's uploads and is restored afterwards.
     """
     short = cfg.get("short", False)
     bps = 4 if short else 8
     result = {}
 
-    saved_tables = transport.filter_tables
-    if cfg.get("repair") is False:
-        transport.filter_tables = None
-    elif cfg.get("repair") is True and transport.shipped_tables is None:
-        result["repair_note"] = "repair forced on but no filter_tables.json loaded"
-    result["repair_active"] = transport.filter_tables is not None
+    repair = transport.repair
+    saved_mode = repair.mode if repair else None
+    want = cfg.get("repair")
+    if repair and want is False:
+        repair.mode = "off"
+    elif repair and isinstance(want, str):
+        if repair.available(want):
+            repair.mode = want
+        else:
+            result["repair_note"] = f"repair {want} requested but not available"
+    elif want and (not repair or repair.mode == "off"):
+        result["repair_note"] = "repair forced on but none is available"
+    result["repair_mode"] = repair.mode if repair else "off"
+    result["repair_active"] = result["repair_mode"] != "off"
 
     api("smAbort", dev)
     api("smSetIQBaseSampleRate", dev, cfg.get("base_rate", smIQStreamSampleRateNative))
@@ -202,7 +210,8 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     if status < 0:
         result["error"] = api.err(status)
         result["transport"] = transport.snapshot()
-        transport.filter_tables = saved_tables
+        if repair:
+            repair.mode = saved_mode
         return result
 
     rate, bw, actual = ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
@@ -266,7 +275,8 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     )
     result["transport"] = transport.snapshot()
     api("smAbort", dev)
-    transport.filter_tables = saved_tables
+    if repair:
+        repair.mode = saved_mode
     return result
 
 
@@ -341,10 +351,17 @@ EXPERIMENTS = {
                       "DSP chain including the stubbed FIR."),
     # The A/B that answers the filter question in one session. Same settings,
     # repair on then off. If repaired is non-zero and the raw one is zeros, the
-    # impulse filters are the cause. Run these two together and compare.
+    # impulse filters are the cause. Run these together and compare. The
+    # tables run uses the constant tables instead, for comparison; it needs
+    # filter_tables.json.
     "iq-ab-repair-on": ("iq", {"decimation": 8, "center": 1e9, "short": True,
-                               "repair": True},
-                        "A/B, repair ON: filters replaced with shipped coefficients."),
+                               "repair": "design"},
+                        "A/B, repair ON: filters designed as the Linux build "
+                        "would for these settings."),
+    "iq-ab-repair-tables": ("iq", {"decimation": 8, "center": 1e9, "short": True,
+                                   "repair": "tables"},
+                            "A/B, repair with the constant tables extracted from "
+                            "a Linux .so, same settings."),
     "iq-ab-repair-off": ("iq", {"decimation": 8, "center": 1e9, "short": True,
                                 "repair": False},
                          "A/B, repair OFF: the library's own impulse filters, "
@@ -422,6 +439,9 @@ def ab_verdict(experiments):
         line += ("Both are zeros with data flowing, so the impulse filters are "
                  "not the only problem; the setup path needs comparing against "
                  "the Linux build.")
+    tables = by.get("iq-ab-repair-tables")
+    if tables and "result" in tables:
+        line += f" With the constant tables instead: {summary(tables['result'])}."
     return line
 
 
@@ -566,9 +586,14 @@ def main():
     ap.add_argument("--keep-samples", type=int, default=65536,
                     help="samples to save per experiment, 0 to skip")
     ap.add_argument("--outdir", default="sm_diag_out")
+    ap.add_argument("--filter-repair", choices=("design", "tables", "off"),
+                    default="design",
+                    help="what replaces the impulse filter uploads (default design)")
     ap.add_argument("--no-filter-repair", action="store_true",
-                    help="send the library's own filter uploads unmodified")
+                    help="same as --filter-repair off")
     args = ap.parse_args()
+    if args.no_filter_repair:
+        args.filter_repair = "off"
 
     if args.list:
         for name, (kind, cfg, why) in EXPERIMENTS.items():
@@ -600,7 +625,7 @@ def main():
     lib = ctypes.CDLL(args.dylib)
     bind(lib)
     slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
-    transport = T.Transport(T.load_filter_tables(not args.no_filter_repair))
+    transport = T.Transport(T.load_filter_repair(args.dylib, slide, args.filter_repair))
     T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
     shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
     if not os.path.exists(shim):
@@ -709,8 +734,15 @@ def main():
         if framing or r.get("sync_flags"):
             print(f"  framing: {framing}  sync-flagged reads {r.get('sync_flags', 0)}")
         if t.get("filter_repairs"):
-            stages = sorted({r["stage"] for r in t["filter_repairs"]})
-            print(f"  repaired impulse filter uploads for stages {stages}")
+            done = [r for r in t["filter_repairs"] if r.get("repaired")]
+            cut = ", ".join(f"{r['stage']}: {r['fc']:.4f}" if "fc" in r else str(r["stage"])
+                            for r in done)
+            mode = done[0].get("mode", "?") if done else "?"
+            print(f"  repaired impulse filter uploads ({mode}), stage cutoffs {cut}")
+            missed = [r for r in t["filter_repairs"] if not r.get("repaired")]
+            if missed:
+                print(f"  ! {len(missed)} impulse uploads not repaired: "
+                      f"{sorted({r.get('reason', '?') for r in missed})}")
         if head:
             print(f"  head {head[:72]}")
         report["experiments"].append(entry)
@@ -718,7 +750,7 @@ def main():
     report["ab_verdict"] = ab_verdict(report["experiments"])
     if report["ab_verdict"]:
         print("\n=== filter A/B ===\n  " + report["ab_verdict"])
-    report["filter_repair"] = transport.shipped_tables is not None
+    report["filter_repair"] = transport.repair.mode if transport.repair else "off"
 
     report["api_errors"] = api.log
     api("smAbort", dev)

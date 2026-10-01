@@ -624,6 +624,14 @@ void smn_deallocate(void *self)
 }
 
 int smn_repair_packet(uint32_t *w, int nwords);
+static int scan_filters(uint32_t *w, int nwords, bool apply);
+
+/* Optional: a function that repairs a packet containing an impulse upload in
+ * place and returns how many it repaired. sm_native.py registers one so both
+ * backends share the Python filter design; filter uploads only happen while
+ * configuring, never on the data path. Without one, the tables are used. */
+typedef int (*smn_repair_cb)(void *self, uint32_t *words, int nwords);
+static smn_repair_cb repair_cb;
 
 void smn_begin_cmd(void *self, int idx, const uint8_t *cmd)
 {
@@ -632,7 +640,12 @@ void smn_begin_cmd(void *self, int idx, const uint8_t *cmd)
 		return;
 	uint32_t words[CMD_WORDS];
 	memcpy(words, cmd, CMD_BYTES);
-	f->st.filter_repairs += (uint64_t)smn_repair_packet(words, CMD_WORDS);
+	if (repair_cb) {
+		if (scan_filters(words, CMD_WORDS, false))
+			f->st.filter_repairs += (uint64_t)repair_cb(self, words, CMD_WORDS);
+	} else {
+		f->st.filter_repairs += (uint64_t)smn_repair_packet(words, CMD_WORDS);
+	}
 	f->st.commands++;
 	ssize_t n = send(f->sock, words, CMD_BYTES, 0);
 	f->cmd_sent[idx] = n < 0 ? 0 : (int)n;
@@ -760,6 +773,11 @@ int smn_xfer_len(void *self, int idx)
 
 /* ---- filter repair -------------------------------------------------------- */
 
+void smn_set_repair_callback(smn_repair_cb cb)
+{
+	repair_cb = cb;
+}
+
 void smn_set_filter_table(int taps, const double *coeffs)
 {
 	if (taps <= 0 || taps >= 256)
@@ -769,11 +787,12 @@ void smn_set_filter_table(int taps, const double *coeffs)
 	memcpy(filter_table[taps], coeffs, sizeof(double) * taps);
 }
 
-/* Replace WriteIQFilter uploads carrying a unit impulse with the shipped
- * coefficients. Layout: header (0x04 << 24 | words << 16 | addr), eight zero
- * words, then (n + 1) / 2 int32 coefficients, edge to centre inclusive.
- * Anything that is not an impulse passes through. Returns repairs made. */
-int smn_repair_packet(uint32_t *w, int nwords)
+/* Find WriteIQFilter uploads carrying a unit impulse. Layout: header
+ * (0x04 << 24 | words << 16 | addr), eight zero words, then (n + 1) / 2 int32
+ * coefficients, edge to centre inclusive. With apply set, replace each with
+ * the table coefficients and return the number replaced; without, change
+ * nothing and return the number found. */
+static int scan_filters(uint32_t *w, int nwords, bool apply)
 {
 	int repairs = 0;
 	for (int i = 0; i < nwords; i++) {
@@ -802,7 +821,9 @@ int smn_repair_packet(uint32_t *w, int nwords)
 		for (int k = start; k < end - 1 && impulse; k++)
 			if (w[k])
 				impulse = false;
-		if (impulse && filter_table[n]) {
+		if (impulse && !apply) {
+			repairs++;
+		} else if (impulse && filter_table[n]) {
 			double sum = 0;
 			for (int k = 0; k < n; k++)
 				sum += filter_table[n][k];
@@ -813,6 +834,12 @@ int smn_repair_packet(uint32_t *w, int nwords)
 		i = end - 1;
 	}
 	return repairs;
+}
+
+/* Replace impulse uploads with the table coefficients. Returns repairs made. */
+int smn_repair_packet(uint32_t *w, int nwords)
+{
+	return scan_filters(w, nwords, true);
 }
 
 /* ---- semaphores ------------------------------------------------------------ */
@@ -935,4 +962,4 @@ void smn_get_stats(void *owner, smn_stats_t *out)
 }
 
 int smn_stats_size(void) { return (int)sizeof(smn_stats_t); }
-const char *smn_version(void) { return "sm_native 1.2"; }
+const char *smn_version(void) { return "sm_native 1.3"; }

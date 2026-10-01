@@ -6,8 +6,9 @@ sm_transport.py runs each transport method as a Python callback, this points the
 same vtable slots straight at the exported C functions in libsmnative.dylib, so no
 Python runs on the data path at all. A dedicated receiver thread inside the
 library drains the socket. It also redirects the broken semaphore imports to the
-native shim in the same dylib, and loads the decimation filter tables so impulse
-uploads are repaired in the C send path.
+native shim in the same dylib, and registers a callback so impulse filter
+uploads are repaired by the same Python code the other backend uses. Filter
+uploads happen only while configuring, so no Python runs on the data path.
 
 Use this instead of sm_transport.py when you need decimation 1. For sweeps and
 higher decimations either backend works; the Python one is easier to instrument.
@@ -15,14 +16,12 @@ higher decimations either backend works; the Python one is easier to instrument.
     python3 sm_native.py <libsm_api.dylib> <host-ip> <dev-ip> <port>
 
 Build the dylib first:  make -C native   (or see the Makefile beside this file)
-Produce filter_tables.json once:  python3 sm_filters.py extract <a Linux .so>
 """
 
 import ctypes
 import os
 import sys
 
-import sm_filters
 import sm_transport as T   # reuse its Mach-O parsing and slot map
 
 
@@ -82,22 +81,32 @@ def patch_semaphores_native(path, slide, native):
     print(f"redirected {len(SEM_MAP)} semaphore imports to native shim")
 
 
-def load_filter_tables_native(native, enabled=True):
-    if not enabled:
-        print("filter repair disabled")
-        return
-    here = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(here, sm_filters.TABLES_FILE)
-    if not os.path.exists(p):
-        print(f"no {sm_filters.TABLES_FILE}; I/Q filter uploads will not be repaired")
-        return
-    tables = sm_filters.load_tables(p)
-    native.smn_set_filter_table.argtypes = [ctypes.c_int,
-                                            ctypes.POINTER(ctypes.c_double)]
-    for taps, coeffs in tables.items():
-        arr = (ctypes.c_double * len(coeffs))(*coeffs)
-        native.smn_set_filter_table(int(taps), arr)
-    print(f"filter repair on: shipped tables for {sorted(tables)} taps")
+REPAIR_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                             ctypes.POINTER(ctypes.c_uint32), ctypes.c_int)
+
+
+def register_filter_repair(native, repair):
+    """Have the C send path hand impulse filter uploads to repair (a FilterRepair).
+
+    The callback edits the packet in place and returns how many uploads it
+    replaced, which the C side adds to its filter_repairs counter.
+    """
+    def callback(this, words, nwords):
+        try:
+            original = words[:nwords]
+            fixed, report = repair.apply(this, original)
+            for i, (a, b) in enumerate(zip(original, fixed)):
+                if a != b:
+                    words[i] = b & 0xFFFFFFFF
+            return sum(1 for r in report if r.get("repaired"))
+        except Exception as e:                  # never let an error unwind into C
+            print(f"  ! filter repair failed: {e}")
+            return 0
+
+    cb = REPAIR_CB(callback)
+    T.KEEP_ALIVE.append(cb)
+    native.smn_set_repair_callback.argtypes = [ctypes.c_void_p]
+    native.smn_set_repair_callback(ctypes.cast(cb, ctypes.c_void_p))
 
 
 def declare(native):
@@ -143,12 +152,14 @@ def stats(native, owner=None):
     return s
 
 
-def install(libsm_path, filter_repair=True, promote=True):
+def install(libsm_path, filter_mode="design", promote=True):
     """Load libsm_api, install the native backend, and return (lib, native).
 
     Importable entry point for sm_iq_capture. After this returns,
     smOpenNetworkedDevice and the I/Q calls work through the native transport.
-    promote=False leaves the library's own thread priorities alone, for A/B runs.
+    filter_mode is "design", "tables" or "off"; native.filter_repair is the
+    FilterRepair, whose mode can be changed later. promote=False leaves the
+    library's own thread priorities alone, for A/B runs.
     """
     native = ctypes.CDLL(native_lib_path())
     declare(native)
@@ -166,7 +177,8 @@ def install(libsm_path, filter_repair=True, promote=True):
     native.smn_set_promote(1 if promote else 0)
     patch_vtable_native(addrs[T.VTABLE_SYM] + slide, native)
     patch_semaphores_native(libsm_path, slide, native)
-    load_filter_tables_native(native, filter_repair)
+    native.filter_repair = T.load_filter_repair(libsm_path, slide, filter_mode)
+    register_filter_repair(native, native.filter_repair)
     return lib, native
 
 

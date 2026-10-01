@@ -152,6 +152,26 @@ def symbol_addresses(path, wanted):
 
 
 
+def function_sizes(path, names):
+    """Byte length of each named function: up to the next symbol after it."""
+    data = open(path, "rb").read()
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    off, symoff, nsyms = 32, None, None
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == 0x2:  # LC_SYMTAB
+            _, _, symoff, nsyms, _, _ = struct.unpack_from("<IIIIII", data, off)
+        off += cmdsize
+    values = sorted({struct.unpack_from("<Q", data, symoff + i * 16 + 8)[0]
+                     for i in range(nsyms)} - {0})
+    starts = symbol_addresses(path, set(names))
+    sizes = {}
+    for name, start in starts.items():
+        later = [v for v in values if v > start]
+        sizes[name] = (later[0] - start) if later else 64
+    return sizes
+
+
 class InterfaceStatus:
     """The library's per-device transfer status: read it, and clear it.
 
@@ -213,35 +233,242 @@ class InterfaceStatus:
         return old
 
 
-def load_filter_tables(enabled=True):
-    """Load filter_tables.json from beside this file, if repair is wanted.
+class IQSettings:
+    """Read the I/Q settings the library designs its decimation filters from.
 
-    Produce it once with:  python3 sm_filters.py extract <path to a Linux .so>
+    ConfigureIQStreamingNet derives the four filter cutoffs from the sample
+    rate mode, the decimation and the bandwidth held in SmDevice. This finds
+    the SmDevice behind a LinuxSockInterface and reads those three fields, so
+    the repair designs the same filters the Linux build would, whoever set them.
+
+    Nothing is hard coded. Each field offset is decoded from the store in its
+    setter, the interface chain from the loads that follow it, and the results
+    are checked for consistency. If a future build changes shape so the
+    decoding fails, the constructor raises and the caller can fall back.
+
+        SetIQStreamingSampleRate(SmIQStreamSampleRate)  stores w1  -> rate mode
+        SetIQSampleRate(int)                            stores w1  -> decimation
+        SetIQBandwidth(SmBool, double)                  stores d0  -> bandwidth
+        UpdateAuxData                  ldr x0, [xN, #off]  SmDevice -> DeviceInterface
+        DeviceInterfaceNetworked::BeginCommandXfer
+                                       ldr x0, [x0, #off]  -> LinuxSockInterface
     """
-    if not enabled:
-        print("filter repair disabled; I/Q filter uploads sent as the library built them")
+
+    SET_RATE = "__ZN8SmDevice24SetIQStreamingSampleRateE20SmIQStreamSampleRate"
+    SET_DEC = "__ZN8SmDevice15SetIQSampleRateEi"
+    SET_BW = "__ZN8SmDevice14SetIQBandwidthE6SmBoold"
+    AUX = "__ZN8SmDevice13UpdateAuxDataEb"
+    NET_CMD = "__ZN24DeviceInterfaceNetworked16BeginCommandXferEiPKh"
+    SYMS = {"_deviceList", SET_RATE, SET_DEC, SET_BW, AUX, NET_CMD}
+    MAX_DEVICES = 16
+
+    def __init__(self, path, slide):
+        try:
+            a = symbol_addresses(path, self.SYMS)
+        except SystemExit as e:
+            raise RuntimeError(str(e)) from None
+        size = function_sizes(path, {self.SET_RATE, self.SET_DEC, self.SET_BW})
+        self.table = a["_deviceList"] + slide
+        self.rate_off = self._store_offset(a[self.SET_RATE] + slide, False, size[self.SET_RATE])
+        self.dec_off = self._store_offset(a[self.SET_DEC] + slide, False, size[self.SET_DEC])
+        self.bw_off = self._store_offset(a[self.SET_BW] + slide, True, size[self.SET_BW])
+        self.iface_off = InterfaceStatus._ldr_offset(a[self.AUX] + slide, 20, 8)
+        self.sock_off = InterfaceStatus._ldr_offset(a[self.NET_CMD] + slide, 4, 8)
+        offs = (self.rate_off, self.dec_off, self.bw_off, self.iface_off, self.sock_off)
+        if None in offs:
+            raise RuntimeError("could not decode the I/Q settings offsets; "
+                               "the library layout has changed")
+        # The three settings sit together in one block, in this order.
+        if not (self.rate_off < self.dec_off < self.bw_off <= self.rate_off + 0x40):
+            raise RuntimeError(f"I/Q settings offsets look wrong: rate {self.rate_off:#x}, "
+                               f"decimation {self.dec_off:#x}, bandwidth {self.bw_off:#x}")
+
+    @staticmethod
+    def _store_offset(addr, fp, size):
+        """Offset from `this` at which a setter stores its argument.
+
+        Follows x0 (this), constants loaded with movz, and add of the two, until
+        the argument register is stored through one of them: w1 for an int, d0
+        for a double. A ret or unconditional branch resets tracking to the
+        entry state, so code reached through a jump table is read correctly.
+        Only the function's own size bytes are read. Returns None if no such
+        store is found.
+        """
+        regs = {0: ("base", 0)}
+
+        def base_of(n):
+            r = regs.get(n)
+            return r[1] if r and r[0] == "base" else None
+
+        def const_of(n):
+            r = regs.get(n)
+            return r[1] if r and r[0] == "const" else None
+
+        for i in range(min(size, 512) // 4):
+            w = ctypes.c_uint32.from_address(addr + 4 * i).value
+            rd, rn, rm = w & 31, (w >> 5) & 31, (w >> 16) & 31
+            if w == 0xD65F03C0 or (w & 0xFC000000) == 0x14000000:      # ret, b
+                regs = {0: ("base", 0)}
+                continue
+            if (w & 0x7F800000) == 0x52800000:                          # movz
+                regs[rd] = ("const", ((w >> 5) & 0xFFFF) << (((w >> 21) & 3) * 16))
+                continue
+            if (w & 0xFF200000) == 0x8B000000 and not (w >> 10) & 0x3F:  # add xd, xn, xm
+                b, c = base_of(rn), const_of(rm)
+                if b is None:
+                    b, c = base_of(rm), const_of(rn)
+                regs[rd] = ("base", b + c) if b is not None and c is not None else None
+                continue
+            if (w & 0xFF800000) == 0x91000000:                          # add xd, xn, #imm
+                b = base_of(rn)
+                imm = ((w >> 10) & 0xFFF) << (12 if w & (1 << 22) else 0)
+                regs[rd] = ("base", b + imm) if b is not None else None
+                continue
+            want_rt = 0 if fp else 1
+            size = 0xFC000000 if fp else 0xB8000000                     # str d / str w families
+            if (w & 0xFFC00000) == size + 0x01000000 and rd == want_rt:  # unsigned imm
+                b = base_of(rn)
+                if b is not None:
+                    return b + ((w >> 10) & 0xFFF) * (8 if fp else 4)
+            elif (w & 0xFFE00C00) == size and rd == want_rt:              # stur, simm9
+                b = base_of(rn)
+                if b is not None:
+                    imm = (w >> 12) & 0x1FF
+                    return b + (imm - 0x200 if imm & 0x100 else imm)
+            elif (w & 0xFFE00C00) == size + 0x00200800 and rd == want_rt:  # register offset
+                if not (w >> 12) & 1 and (w >> 13) & 7 in (3, 7):
+                    b, c = base_of(rn), const_of(rm)
+                    if b is not None and c is not None:
+                        return b + c
+            elif (w >> 25) & 5 == 4 and not (w >> 22) & 1:
+                continue                       # some other store: writes no register
+            elif rd in regs and rd != 31:
+                regs[rd] = None                # anything else may overwrite rd
         return None
+
+    def device_for(self, sock_iface):
+        """The SmDevice whose network interface is this LinuxSockInterface."""
+        for i in range(self.MAX_DEVICES):
+            dev = ctypes.c_void_p.from_address(self.table + 8 * i).value
+            if not dev:
+                continue
+            iface = ctypes.c_void_p.from_address(dev + self.iface_off).value
+            if iface and ctypes.c_void_p.from_address(iface + self.sock_off).value == sock_iface:
+                return dev
+        return None
+
+    def read(self, sock_iface):
+        """(rate_mode, decimation, bandwidth), or None if they cannot be trusted."""
+        dev = self.device_for(sock_iface)
+        if dev is None:
+            return None
+        rate = ctypes.c_int32.from_address(dev + self.rate_off).value
+        dec = ctypes.c_int32.from_address(dev + self.dec_off).value
+        bw = ctypes.c_double.from_address(dev + self.bw_off).value
+        if (rate not in sm_filters.BASE_RATE or not 1 <= dec <= 8192
+                or dec & (dec - 1) or not 0 < bw < 1e9):
+            return None
+        return rate, dec, bw
+
+    @staticmethod
+    def taps_from(settings):
+        """A taps_for function for sm_filters.repair_packet, from read()'s result."""
+        def taps(stage):
+            if settings is None:
+                return None
+            fc = sm_filters.stage_cutoffs(*settings)[stage - 1]
+            return sm_filters.design_taps(sm_filters.STAGES[stage][0], fc), fc
+        return taps
+
+
+class FilterRepair:
+    """What replaces an impulse filter upload. Shared by both backends.
+
+    mode is live and may be changed between configurations:
+      "design"  the filter the Linux build would design for the current settings
+      "tables"  the constant tables extracted from a Linux .so (for comparison)
+      "off"     send the library's uploads unchanged
+    """
+
+    MODES = ("design", "tables", "off")
+    MAX_LOG = 64
+
+    def __init__(self, settings=None, tables=None, mode="design"):
+        self.settings = settings
+        self.tables = tables
+        self.mode = mode
+        self.log = []          # recent impulse uploads seen, newest last
+        self.seen = 0          # all impulse uploads seen, for slicing the log
+
+    def available(self, mode):
+        return {"design": self.settings is not None,
+                "tables": self.tables is not None, "off": True}[mode]
+
+    def apply(self, this, words):
+        """Repair one command packet. Returns (words, report)."""
+        settings = None
+        if self.mode == "design" and self.settings is not None:
+            settings = self.settings.read(this)
+            words, report = sm_filters.repair_packet(
+                words, taps_for=IQSettings.taps_from(settings))
+        elif self.mode == "tables" and self.tables is not None:
+            words, report = sm_filters.repair_packet(words, tables=self.tables)
+        else:
+            return words, []
+        for r in report:
+            if r["impulse"]:
+                r["mode"] = self.mode
+                if settings is not None:
+                    r["rate_mode"], r["decimation"], r["bandwidth"] = settings
+                self.log.append(r)
+                self.seen += 1
+        del self.log[:-self.MAX_LOG]
+        return words, report
+
+
+def load_filter_repair(dylib, slide, mode="design"):
+    """Build the FilterRepair for both backends.
+
+    "design" needs only the dylib. filter_tables.json, if it sits beside this
+    file, is loaded too so "tables" can be selected later for comparison. If
+    the requested mode is not available, say so and fall back: design to
+    tables to off.
+    """
+    if mode not in FilterRepair.MODES:
+        raise ValueError(f"filter repair mode must be one of {FilterRepair.MODES}")
+    tables = settings = None
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), sm_filters.TABLES_FILE)
-    if not os.path.exists(path):
-        print(f"no {sm_filters.TABLES_FILE}; I/Q filter uploads will not be repaired")
-        return None
-    tables = sm_filters.load_tables(path)
-    print(f"filter repair on: shipped tables for {sorted(tables)} taps")
-    return tables
+    if os.path.exists(path):
+        tables = sm_filters.load_tables(path)
+    try:
+        settings = IQSettings(dylib, slide)
+    except Exception as e:                     # any decoding failure: fall back
+        print(f"filter design unavailable: {e}")
+    repair = FilterRepair(settings, tables, mode)
+    if not repair.available(mode):
+        for fallback in FilterRepair.MODES[FilterRepair.MODES.index(mode) + 1:]:
+            if repair.available(fallback):
+                print(f"filter repair: {mode} not available, using {fallback}")
+                repair.mode = fallback
+                break
+    if repair.mode == "design":
+        print(f"filter repair on: designed from the device's settings "
+              f"(decimation at SmDevice+{settings.dec_off:#x})")
+    elif repair.mode == "tables":
+        print(f"filter repair on: shipped tables for {sorted(tables)} taps")
+    else:
+        print("filter repair off; I/Q filter uploads sent as the library built them")
+    return repair
+
 
 class Transport:
     """Per-interface state, keyed by the C++ `this` pointer."""
 
-    def __init__(self, filter_tables=None):
+    def __init__(self, repair=None):
         self.by_this = {}
-        # Signal Hound's shipped decimation filter coefficients, used to repair
-        # the impulse uploads the macOS build sends. filter_tables is the live
-        # setting: setting it to None disables repair, and callers may flip it
-        # per experiment. shipped_tables keeps the loaded set regardless, so a
-        # caller can tell "repair is off right now" from "no tables were ever
-        # loaded".
-        self.filter_tables = filter_tables
-        self.shipped_tables = filter_tables
+        # FilterRepair for the impulse uploads the macOS build sends, or None.
+        # Its mode is the live setting; callers may change it per experiment.
+        self.repair = repair
 
     def state(self, this):
         st = self.by_this.get(this)
@@ -364,9 +591,9 @@ class Transport:
             while words and words[-1] == 0:
                 words = words[:-1]
             st["commands"].append(list(words))
-        if self.filter_tables is not None:
+        if self.repair is not None:
             words = list(struct.unpack(f"<{CMD_BYTES // 4}I", payload))
-            words, report = sm_filters.repair_packet(words, self.filter_tables)
+            words, report = self.repair.apply(this, words)
             if any(r["impulse"] for r in report):
                 payload = struct.pack(f"<{CMD_BYTES // 4}I",
                                       *[w & 0xFFFFFFFF for w in words])
@@ -589,7 +816,7 @@ def main():
     slide = runtime - addrs[ANCHOR_SYM]
     print(f"api {lib.smGetAPIVersion().decode()}  slide {slide:#x}")
 
-    transport = Transport(load_filter_tables())
+    transport = Transport(load_filter_repair(path, slide))
     patch_vtable(addrs[VTABLE_SYM] + slide, transport)
 
     shim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")

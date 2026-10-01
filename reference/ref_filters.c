@@ -39,10 +39,10 @@ static const struct { int stage, taps; } STAGES[] = {
 	{1, 189}, {2, 79}, {3, 159}, {4, 159},
 };
 
-/* Cutoffs the library itself uses: Linux 2.3.9 defaults and clamps, and the
- * values decoded from the macOS 2.3.7 build. Cycles per stage input sample. */
+/* Cutoffs the library itself uses as defaults and clamps; the same in the
+ * macOS 2.3.7 and Linux 2.3.9 builds. Cycles per stage input sample. */
 static const double KNOWN_FC[] = {
-	0.02, 0.08, 0.083325, 0.2, 0.225, 0.19906250000094589, 0.19790000000029978,
+	0.02, 0.08, 0.083325, 0.2, 0.225,
 };
 
 static const char *SYM_ANCHOR = "smGetAPIVersion";
