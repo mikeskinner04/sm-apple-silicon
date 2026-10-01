@@ -215,9 +215,9 @@ and only window types 1 (Blackman) and 4 (none) are accepted. The window is
 w[i] = 0.42659 - 0.49656 cos(2 pi i / (N - 1)) + 0.076849 cos(4 pi i / (N - 1))
 ```
 
-The aarch64 and x86 builds do not use it for the four fixed stages, though.
-They call `WriteIQFilter(int, const double *, int)` on constant tables, which
-are bit for bit identical in both builds:
+The aarch64 and x86 builds use it for the four fixed stages. They also call
+`WriteIQFilter(int, const double *, int)` on constant tables, bit for bit
+identical in both builds, which earlier versions of this repair substituted:
 
 | stage | taps | centre / sum | approximate cutoff |
 | --- | --- | --- | --- |
@@ -225,9 +225,35 @@ are bit for bit identical in both builds:
 | 2 | 79 | 0.443 | 0.221 |
 | 3 and 4 | 159 | 0.424 | 0.212 |
 
-Cutoffs are fractions of each stage's input rate. The runtime design reproduces
-the tables only to within a few thousandths, so the tables were designed
-another way and baked in. Using them directly is exact.
+But `ConfigureIQStreamingNet` writes the tables into a separate command list,
+the third one passed to the `EngineIQStreamingNetworked` constructor. The
+engine stores it (+0x650 on Linux, +0x648 on macOS) and only its destructor
+touches it again; `XferThreadDirect` and `XferThreadSoftwareDecimation` send
+the first list, which holds the run-time designs. So the device on Linux gets
+designed filters, and the tables are dead code. That is also why the design
+only matched the tables to within a few thousandths: they are different
+filters.
+
+The cutoffs, the same in macOS 2.3.7 and Linux 2.3.9, in cycles per sample at
+each stage's input:
+
+- The bandwidth is first clamped to between 1% and 82.5% of the output rate
+  and written back to `SmDevice`.
+- The defaults are 0.08, 0.2, 0.2 and 0.2.
+- At decimation 1, 2, 4 or 8 the last stage in use is set to
+  `bandwidth * 1.02 / 2` over its input rate, then clamped to at least 0.02
+  and at most 0.083325, 0.2, 0.2 or 0.225. The input rates are a fixed 1 GHz
+  for stage 1, then the base rate, half it and a quarter of it.
+- At decimation 16 and above all four keep the defaults.
+- Decimation 4 and 8 skip the narrowing if the word beside the decimation is
+  set, but `SetIQBandwidth` always writes 0 there.
+
+`SmDevice` holds the rate mode at +0xca78, the decimation at +0xca88 and the
+bandwidth at +0xca90 in the macOS build. The repair decodes these from the
+setters rather than hard coding them. `sm_filters.py` reproduces the cutoffs,
+the design and the encoding; `reference/ref_filters.c` calls the Linux
+library's own functions, and `reference/check_design.py` compares the two bit
+for bit.
 
 ## WriteIQFilter encoding
 

@@ -88,7 +88,9 @@ Each capture ends with a verdict, clean or a list of what was lost, and writes a
 JSON sidecar beside the samples with the loss counters and the sample positions
 of any holes.
 
-For an unattended battery of experiments writing a JSON and HTML report:
+For an unattended battery of experiments on both backends, writing one JSON
+and HTML report with pass/fail checks and charts for every I/Q test (needs
+numpy):
 
 ```
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --list

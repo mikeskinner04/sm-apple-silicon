@@ -54,7 +54,7 @@ A real MAC address rather than `(incomplete)` means the link is good.
 
 No sysctl tuning is needed. See "Socket buffer" below for why.
 
-## 3. Build and extract the filter tables
+## 3. Build
 
 ```
 make
@@ -64,22 +64,26 @@ That produces `sem_shim.dylib`, used by the Python backend, and
 `native/libsmnative.dylib`, the native backend.
 
 The macOS build programs the device's I/Q decimation filters with impulses
-instead of low-pass filters, which makes I/Q streaming return zeros. The Linux
-builds in the same SDK carry the correct coefficients. Extract them once from
-either one:
+instead of low-pass filters, which makes I/Q streaming return zeros. Both
+backends replace each impulse with the filter the Linux build would design for
+the device's current rate mode, decimation and bandwidth. Nothing needs
+extracting for that. To check the design on this machine:
 
 ```
-python3 sm_filters.py extract path/to/lib/aarch64/libsm_api.so.2.3.9
 python3 sm_filters.py selftest
 ```
 
-That writes `filter_tables.json`. Both files must sit in the same directory as
-the Python scripts, which is where they look for them. The tables are read from
-your copy of the SDK rather than stored in this repository because they are
-Signal Hound's data.
+The Linux builds also contain constant tables for these filters, which the
+streaming engine never sends. For comparison, extract them once from either
+Linux library and select them with `--filter-repair tables`:
 
-Without `filter_tables.json` everything still runs, and sweeps still work, but
-I/Q streaming will return zeros.
+```
+python3 sm_filters.py extract path/to/lib/aarch64/libsm_api.so.2.3.9
+```
+
+That writes `filter_tables.json` in the current directory; it must sit beside
+the Python scripts. It is read from your copy of the SDK rather than stored in
+this repository because it is Signal Hound's data.
 
 ## 4. First run
 
@@ -95,7 +99,7 @@ Expected output:
 
 ```
 api 2.3.7  slide 0x...
-filter repair on: shipped tables for [79, 159, 189] taps
+filter repair on: designed from the device's settings (decimation at SmDevice+0xca88)
 patched 10 vtable slots at 0x...
 redirected 4 semaphore imports to .../sem_shim.dylib
   SO_RCVBUF 8388608 (asked 100000000)
@@ -125,7 +129,8 @@ Useful options:
 | `--ref-level` | dBm, with the attenuator on automatic |
 | `--queue-ms` | smaller queue means faster retunes and less tolerance to interruption |
 | `--out` | output path; several frequencies each get a suffix |
-| `--no-filter-repair` | send the library's own filter uploads, for comparison |
+| `--filter-repair` | `design` (default), `tables`, or `off` to send the library's own uploads |
+| `--no-filter-repair` | same as `--filter-repair off` |
 | `--native` | use the C backend; needed below decimation 8 |
 | `--discard` | read the stream but write nothing, to test the link without the disk |
 | `--no-promote` | native only: leave the library's thread priorities alone |
@@ -211,18 +216,52 @@ sidecar as `[first_sample, length]`. The scan needs numpy.
 
 ## 7. Run the diagnostics
 
-`sm_diag.py` opens the device once and runs a battery of experiments unattended,
-writing `report.json`, a self contained `report.html`, and a raw transfer dump
-per experiment into `sm_diag_out/`.
+`sm_diag.py` runs a battery of experiments unattended on both backends and
+writes one `report.json` and one self contained `report.html` into
+`sm_diag_out/`, with each backend's own results and raw transfer dumps in
+`sm_diag_out/python/` and `sm_diag_out/native/`. It needs numpy
+(`pip3 install numpy`) and, for the native half, `make -C native`.
 
 ```
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --list
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --all
+python3 sm_diag.py ./libsm_api.2.3.7.dylib --all --backends native
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --only sweep,iq-dec8-short
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --interactive
 ```
 
+Both backends patch the same places in the library, so each runs in a process
+of its own, Python first, then native, opening the device in turn. The
+experiments marked native only, such as `iq-dec1-short`, run on the native
+backend and show as skipped on the Python one. `--backends python` or
+`--backends native` runs just one.
+
 Each experiment is isolated. A failure is recorded and the run continues.
+
+Every I/Q experiment is checked, and passes only if every check does:
+
+| check | passes when |
+| --- | --- |
+| data | every requested sample was read, with no error |
+| samples | over 0.5% of bytes are non-zero; for `iq-ab-repair-off`, that they are zeros |
+| filters | all four stages were repaired (not checked with repair off) |
+| holes | no datagram-sized stretch anywhere in the capture is all zeros |
+| transport | no datagrams lost and no transfer timed out |
+| library flags | no sample-loss or sync errors from `smGetIQ` |
+| throughput | the harness read at least 95% of the sample rate |
+
+A timestamps line is shown too, for information only: it compares each
+block's timestamp with the first plus samples over rate. Until it is known
+whether the library derives timestamps from the device or the host clock, it
+does not count towards the verdict.
+
+Each I/Q experiment also gets three charts in the report. The zero map covers
+the whole capture: green where data arrived, red where a datagram-sized
+stretch came back as exact zeros, and ticks where `smGetIQ` flagged sample
+loss or a sync error. The I/Q trace shows the first 512 samples. The
+spectrogram covers the samples kept for the report (`--keep-samples`, 65,536
+by default), so a stretch of zeros shows as a dark band. Sweeps get their
+trace.
 
 The library has one connection-lost status per device, and a single failed
 transfer or command sets it to -6 for good, after which every I/Q call fails.
@@ -231,16 +270,18 @@ failed is named, and each experiment starts with it cleared and records what it
 found on entry and left on exit.
 
 The filter A/B is built in. The `iq-ab-repair-on` and `iq-ab-repair-off`
-experiments run the same settings with repair forced on and then off, in one
-session, so no second run into a separate directory is needed. The report and
+experiments run the same settings with the designed repair and then with
+repair off, in one session, so no second run into a separate directory is
+needed. `iq-ab-repair-tables` repeats them with the constant tables, if
+`filter_tables.json` is present. The report and
 the console print a plain verdict comparing the two: if the repaired capture
 has real samples and the raw one is zeros, the impulse filters are the cause and
 the repair is the fix. If both stream data but both are zeros, the filters are
 not the only problem and the setup path needs comparing against the Linux build.
 
-The whole run still respects `--no-filter-repair`, which forces repair off
-everywhere except experiments that set it explicitly, so the A/B pair still does
-its own thing.
+The whole run respects `--filter-repair` (or `--no-filter-repair`) everywhere
+except experiments that set it explicitly, so the A/B runs still do their own
+thing.
 
 `iq-atten0-again` repeats the experiment where the first framing slip was seen,
 to show whether it is reproducible, and `iq-soak` streams for five seconds to
@@ -345,7 +386,7 @@ same as getting correct bytes out.
 | `make test` fails with "simulator did not start" on macOS | 127.0.0.2 is not configured on loopback | `sudo ifconfig lo0 alias 127.0.0.2 up` |
 | Samples look plausible but signals appear at the wrong frequency | aliasing from the stubbed filter at decimation 16 or above | use decimation 8 or below, or filter yourself |
 | SFP diagnostics all zero | the transceiver does not report DDM | harmless |
-| Sweeps work, every I/Q mode returns exact zeros | impulse decimation filters | extract `filter_tables.json` as in step 3 |
+| Sweeps work, every I/Q mode returns exact zeros | impulse decimation filters not repaired | check the "filter repair" line at startup; "filter design unavailable" means the library's layout has changed |
 | `expected one 79-tap table, found 0` | wrong file given to `sm_filters.py extract` | point it at a Linux `libsm_api.so`, not the macOS dylib |
 
 ### Socket buffer
