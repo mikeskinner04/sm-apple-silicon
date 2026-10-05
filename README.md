@@ -76,11 +76,12 @@ python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib \
     --center 1e9,2.4e9 --decimation 64 --seconds 2
 ```
 
-At full rate, 200 MS/s, use the native backend and 16-bit samples. Prove the
+At full rate, 200 MS/s, use 16-bit samples; the native backend, the default,
+handles the rate. Prove the
 link with `--discard` before involving the disk:
 
 ```
-python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --native \
+python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib \
     --decimation 1 --short --seconds 10 --discard
 ```
 
@@ -97,6 +98,19 @@ python3 sm_diag.py ./libsm_api.2.3.7.dylib --list
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --all
 python3 sm_diag.py ./libsm_api.2.3.7.dylib --interactive
 ```
+
+From your own code, `sm200c.py` gives the same in one class, covering tuning,
+sweeps and all four I/Q modes:
+
+```python
+from sm200c import SM200C
+
+with SM200C("./libsm_api.2.3.7.dylib") as sm:
+    sm.configure_iq(center=1e9, decimation=8)
+    samples = sm.read_iq(1 << 20).samples          # complex64
+```
+
+See section 12 of the guide for the rest.
 
 ## Host setup
 

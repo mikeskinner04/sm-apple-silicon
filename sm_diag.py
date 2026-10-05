@@ -17,113 +17,28 @@ Needs numpy.
 """
 
 import argparse
-import ctypes
 import json
 import os
 import struct
 import subprocess
 import sys
 import time
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import numpy as np
 except ImportError:
     sys.exit("sm_diag needs numpy for its checks and charts: pip3 install numpy")
-import sm_charts
-import sm_transport as T
+import sm_charts  # noqa: E402
+from sm200c import (SM200C, SmError, SmWarning, DEFAULT_HOST, DEFAULT_DEVICE,  # noqa: E402
+                    DEFAULT_PORT)
 
-# ---- sm_api.h constants -----------------------------------------------------
-SM_AUTO_ATTEN = -1
-smDataType32fc, smDataType16sc = 0, 1
-smModeIdle, smModeSweeping, smModeRealTime, smModeIQStreaming = 0, 1, 2, 3
-smIQStreamSampleRateNative, smIQStreamSampleRateLTE = 0, 1
-smFalse, smTrue = 0, 1
-smPowerStateOn, smPowerStateStandby = 0, 1
-smDetectorAverage, smDetectorMinMax = 0, 1
-smScaleLog = 0
-smVideoLog = 0
-smWindowFlatTop = 0
-smSweepSpeedAuto, smSweepSpeedNormal, smSweepSpeedFast = 0, 1, 2
 SM_SYNC_ERR = -11             # smSyncErr: aux block missing where expected
-NETWORKED_BASE_RATE = 200e6
-DEVICE_TYPES = {0: "SM200A", 1: "SM200B", 2: "SM200C", 3: "SM435B", 4: "SM435C"}
-
-
-def bind(lib):
-    ci, cd, cf = ctypes.c_int, ctypes.c_double, ctypes.c_float
-    p, cc = ctypes.POINTER, ctypes.c_char_p
-    lib.smGetErrorString.restype = cc
-    lib.smGetErrorString.argtypes = [ci]
-    lib.smGetAPIVersion.restype = cc
-    lib.smOpenNetworkedDevice.argtypes = [p(ci), cc, cc, ctypes.c_uint16]
-    for name, argtypes in {
-        "smCloseDevice": [ci],
-        "smAbort": [ci],
-        "smPreset": [ci],
-        "smGetDeviceInfo": [ci, p(ci), p(ci)],
-        "smGetFirmwareVersion": [ci, p(ci), p(ci), p(ci)],
-        "smGetDeviceDiagnostics": [ci, p(cf), p(cf), p(cf)],
-        "smGetFullDeviceDiagnostics": [ci, ctypes.c_void_p],
-        "smGetSFPDiagnostics": [ci, p(cf), p(cf), p(cf), p(cf)],
-        "smGetCalDate": [ci, p(ctypes.c_uint64)],
-        "smSetPowerState": [ci, ci],
-        "smGetPowerState": [ci, p(ci)],
-        "smGetReference": [ci, p(ci)],
-        "smSetReference": [ci, ci],
-        "smGetGPSState": [ci, p(ci)],
-        "smSetAttenuator": [ci, ci],
-        "smGetAttenuator": [ci, p(ci)],
-        "smSetRefLevel": [ci, cd],
-        "smSetPreselector": [ci, ci],
-        "smGetPreselector": [ci, p(ci)],
-        "smNetworkedSpeedTest": [ci, cd, p(cd)],
-        # I/Q streaming
-        "smSetIQBaseSampleRate": [ci, ci],
-        "smSetIQDataType": [ci, ci],
-        "smSetIQCenterFreq": [ci, cd],
-        "smGetIQCenterFreq": [ci, p(cd)],
-        "smSetIQSampleRate": [ci, ci],
-        "smSetIQBandwidth": [ci, ci, cd],
-        "smSetIQQueueSize": [ci, cf],
-        "smGetIQParameters": [ci, p(cd), p(cd)],
-        "smGetIQCorrection": [ci, p(cf)],
-        "smGetIQ": [ci, ctypes.c_void_p, ci, p(cd), ci, p(ctypes.c_int64), ci,
-                    p(ci), p(ci)],
-        # sweep
-        "smSetSweepSpeed": [ci, ci],
-        "smSetSweepCenterSpan": [ci, cd, cd],
-        "smSetSweepCoupling": [ci, cd, cd, cd],
-        "smSetSweepDetector": [ci, ci, ci],
-        "smSetSweepScale": [ci, ci],
-        "smSetSweepWindow": [ci, ci],
-        "smGetSweepParameters": [ci, p(cd), p(cd), p(cd), p(cd), p(ci)],
-        "smGetSweep": [ci, p(cf), p(cf), p(ctypes.c_int64)],
-        "smConfigure": [ci, ci],
-        "smGetCurrentMode": [ci, p(ci)],
-    }.items():
-        getattr(lib, name).argtypes = argtypes
-
-
-class Api:
-    """Thin wrapper that records every call and never raises on device errors."""
-
-    def __init__(self, lib):
-        self.lib = lib
-        self.log = []
-
-    def __call__(self, name, *args):
-        status = getattr(self.lib, name)(*args)
-        if status != 0:
-            self.log.append({
-                "call": name,
-                "status": status,
-                "message": self.lib.smGetErrorString(status).decode(),
-            })
-        return status
-
-    def err(self, status):
-        return self.lib.smGetErrorString(status).decode()
+smFalse, smTrue = 0, 1
+smIQStreamSampleRateNative, smIQStreamSampleRateLTE = 0, 1
+smSweepSpeedAuto, smSweepSpeedNormal, smSweepSpeedFast = 0, 1, 2
+SPEED_NAMES = {0: "auto", 1: "normal", 2: "fast"}
 
 
 # ---- aux block decoding -----------------------------------------------------
@@ -171,7 +86,7 @@ def segment_samples(decimation):
     return max(16, 2048 * hw // decimation)
 
 
-def run_iq(api, dev, transport, cfg, seconds, keep_samples):
+def run_iq(sm, cfg, seconds, keep_samples):
     """Configure I/Q streaming, pull samples, report what actually arrived.
 
     cfg["repair"], if present, overrides filter repair for this one experiment:
@@ -184,68 +99,57 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     bps = 4 if short else 8
     result = {}
 
-    repair = transport.repair
-    saved_mode = repair.mode if repair else None
+    repair = sm.filter_repair
+    saved_mode = repair.mode
     want = cfg.get("repair")
-    if repair and want is False:
+    if want is False:
         repair.mode = "off"
-    elif repair and isinstance(want, str):
+    elif isinstance(want, str):
         if repair.available(want):
             repair.mode = want
         else:
             result["repair_note"] = f"repair {want} requested but not available"
-    elif want and (not repair or repair.mode == "off"):
+    elif want and repair.mode == "off":
         result["repair_note"] = "repair forced on but none is available"
-    result["repair_mode"] = repair.mode if repair else "off"
-    result["repair_active"] = result["repair_mode"] != "off"
+    result["repair_mode"] = repair.mode
+    result["repair_active"] = repair.mode != "off"
 
-    api("smAbort", dev)
-    api("smSetIQBaseSampleRate", dev, cfg.get("base_rate", smIQStreamSampleRateNative))
-    api("smSetIQDataType", dev, smDataType16sc if short else smDataType32fc)
-    api("smSetIQCenterFreq", dev, cfg.get("center", 1e9))
-    api("smSetIQSampleRate", dev, cfg["decimation"])
-    if cfg.get("bandwidth") is not False:
-        api("smSetIQBandwidth", dev, smFalse,
-            NETWORKED_BASE_RATE / cfg["decimation"] * 0.8)
-    if cfg.get("atten") is not None:
-        api("smSetAttenuator", dev, cfg["atten"])
-    else:
-        api("smSetAttenuator", dev, SM_AUTO_ATTEN)
-        api("smSetRefLevel", dev, cfg.get("ref_level", -20.0))
-    if cfg.get("preselector") is not None:
-        api("smSetPreselector", dev, cfg["preselector"])
-    if cfg.get("queue_ms"):
-        api("smSetIQQueueSize", dev, cfg["queue_ms"])
-
-    transport.snapshot()                      # discard setup-phase counters
-    t0 = time.monotonic()
-    status = api("smConfigure", dev, smModeIQStreaming)
-    result["configure_ms"] = round((time.monotonic() - t0) * 1e3, 1)
-    result["configure_status"] = status
-    if status < 0:
-        result["error"] = api.err(status)
-        result["transport"] = transport.snapshot()
-        if repair:
-            repair.mode = saved_mode
+    try:
+        sm.abort()
+        if cfg.get("atten") is not None:
+            sm.attenuator = cfg["atten"]
+        else:
+            sm.ref_level = cfg.get("ref_level", -20.0)
+        if cfg.get("preselector") is not None:
+            sm.preselector = bool(cfg["preselector"])
+        sm.transport_snapshot()                   # discard setup-phase counters
+        t0 = time.monotonic()
+        info = sm.configure_iq(
+            center=cfg.get("center", 1e9), decimation=cfg["decimation"],
+            data_type="int16" if short else "complex64",
+            base_rate="lte" if cfg.get("base_rate") == smIQStreamSampleRateLTE else "native",
+            queue_ms=cfg.get("queue_ms"))
+        result["configure_ms"] = round((time.monotonic() - t0) * 1e3, 1)
+        result["configure_status"] = 0
+    except SmError as e:
+        result["error"] = str(e)
+        result["configure_status"] = e.status
+        result["transport"] = sm.transport_snapshot()
+        repair.mode = saved_mode
         return result
 
-    rate, bw, actual = ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
-    api("smGetIQParameters", dev, ctypes.byref(rate), ctypes.byref(bw))
-    api("smGetIQCenterFreq", dev, ctypes.byref(actual))
-    scale = ctypes.c_float()
-    api("smGetIQCorrection", dev, ctypes.byref(scale))
-    result.update(sample_rate=rate.value, bandwidth=bw.value,
-                  center_actual=actual.value, correction=scale.value)
+    rate = info.sample_rate
+    result.update(sample_rate=rate, bandwidth=info.bandwidth,
+                  center_actual=info.center, correction=info.correction)
 
     # Blocks of about 5 ms, so per-call overhead stays small at high rates.
     block = 32768
-    while block < rate.value * 0.005 and block < (1 << 20):
+    while block < rate * 0.005 and block < (1 << 20):
         block <<= 1
-    total = max(block, int(rate.value * cfg.get("seconds", seconds)))
+    total = max(block, int(rate * cfg.get("seconds", seconds)))
     seg = segment_samples(cfg["decimation"])
-    buf = ctypes.create_string_buffer(block * bps)
-    view = np.frombuffer(buf, dtype=np.uint8)
-    ns, loss, remaining = ctypes.c_int64(), ctypes.c_int(), ctypes.c_int()
+    buf = sm.iq_buffer(block)
+    view = buf.view(np.uint8).reshape(-1)
 
     captured, losses, nonzero, first_ns, sync_flags = 0, 0, 0, None, 0
     peak = 0
@@ -259,24 +163,23 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
     t0 = time.monotonic()
     while captured < total:
         n = min(block, total - captured)
-        status = api("smGetIQ", dev, buf, n, None, 0, ctypes.byref(ns),
-                     smTrue if first else smFalse, ctypes.byref(loss),
-                     ctypes.byref(remaining))
-        if status == SM_SYNC_ERR:
+        try:
+            b = sm.read_iq(n, out=buf, purge=first)
+        except SmError as e:
+            result["getiq_error"] = e.message
+            break
+        if b.sync_error:
             # GetIQ copies the samples before it checks the sync flag, so they
             # were delivered; the flag says the aux block of some transfer was
             # not where it belonged. Count it and carry on.
             sync_flags += 1
             sync_at.append(captured)
-        elif status < 0:
-            result["getiq_error"] = api.err(status)
-            break
         if first:
-            first_ns = ns.value
+            first_ns = b.timestamp_ns
             t_first = time.monotonic()
             first_n = n
-        elif first_ns and rate.value:
-            err = abs(ns.value - (first_ns + captured / rate.value * 1e9))
+        elif first_ns and rate:
+            err = abs(b.timestamp_ns - (first_ns + captured / rate * 1e9))
             ts_err = err if ts_err is None else max(ts_err, err)
         data = view[:n * bps]
 
@@ -301,7 +204,7 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
             peak = max(peak, int(vals.max()), -int(vals.min()))
         if len(keep) < keep_samples * bps:
             keep += data[:keep_samples * bps - len(keep)].tobytes()
-        if loss.value:
+        if b.sample_loss:
             losses += 1
             loss_at.append(captured)
         captured += n
@@ -329,67 +232,59 @@ def run_iq(api, dev, transport, cfg, seconds, keep_samples):
         short=short,
     )
     result["_keep"] = bytes(keep)
-    result["transport"] = transport.snapshot()
-    api("smAbort", dev)
-    if repair:
-        repair.mode = saved_mode
+    result["transport"] = sm.transport_snapshot()
+    sm.abort()
+    repair.mode = saved_mode
     return result
 
 
-def run_sweep(api, dev, transport, cfg):
+def run_sweep(sm, cfg):
     """A sweep exercises the same RF chain and ADC without the I/Q path.
     Real spectrum here with zero I/Q would localise the fault to I/Q mode."""
     result = {}
-    api("smAbort", dev)
-    api("smSetSweepSpeed", dev, cfg.get("speed", smSweepSpeedNormal))
-    api("smSetSweepCenterSpan", dev, cfg.get("center", 1e9), cfg.get("span", 20e6))
-    api("smSetSweepCoupling", dev, cfg.get("rbw", 100e3), cfg.get("rbw", 100e3), 0.001)
-    api("smSetSweepDetector", dev, smDetectorMinMax, smVideoLog)
-    api("smSetSweepScale", dev, smScaleLog)
-    api("smSetSweepWindow", dev, smWindowFlatTop)
-    api("smSetAttenuator", dev, SM_AUTO_ATTEN)
-    api("smSetRefLevel", dev, cfg.get("ref_level", -20.0))
-
-    transport.snapshot()
-    status = api("smConfigure", dev, smModeSweeping)
-    result["configure_status"] = status
-    if status < 0:
-        result["error"] = api.err(status)
-        result["transport"] = transport.snapshot()
+    try:
+        sm.abort()
+        sm.ref_level = cfg.get("ref_level", -20.0)
+        sm.transport_snapshot()
+        info = sm.configure_sweep(center=cfg.get("center", 1e9), span=cfg.get("span", 20e6),
+                                  rbw=cfg.get("rbw", 100e3), sweep_time=0.001,
+                                  detector="minmax", video_units="log", scale="dBm",
+                                  window="flattop",
+                                  speed=SPEED_NAMES[cfg.get("speed", smSweepSpeedNormal)])
+        result["configure_status"] = 0
+    except SmError as e:
+        result["error"] = str(e)
+        result["configure_status"] = e.status
+        result["transport"] = sm.transport_snapshot()
         return result
-
-    rbw, vbw, start, binsize = (ctypes.c_double() for _ in range(4))
-    size = ctypes.c_int()
-    api("smGetSweepParameters", dev, ctypes.byref(rbw), ctypes.byref(vbw),
-        ctypes.byref(start), ctypes.byref(binsize), ctypes.byref(size))
-    n = size.value
-    result.update(rbw=rbw.value, start_freq=start.value, bin_size=binsize.value,
-                  sweep_size=n)
-    if n <= 0:
+    result.update(rbw=info.rbw, start_freq=info.start, bin_size=info.bin_size,
+                  sweep_size=info.size)
+    if info.size <= 0:
         result["error"] = "sweep size zero"
-        result["transport"] = transport.snapshot()
+        result["transport"] = sm.transport_snapshot()
         return result
-
-    lo = (ctypes.c_float * n)()
-    hi = (ctypes.c_float * n)()
-    ts = ctypes.c_int64()
-    status = api("smGetSweep", dev, lo, hi, ctypes.byref(ts))
-    result["sweep_status"] = status
-    vals = list(hi)
+    try:
+        trace = sm.sweep()
+        result["sweep_status"] = trace.status
+    except SmError as e:
+        result["error"] = str(e)
+        result["transport"] = sm.transport_snapshot()
+        return result
+    vals = trace.max.tolist()
     finite = [v for v in vals if v == v and abs(v) < 1e30]
     if finite:
         peak = max(finite)
         result.update(
             peak_dBm=round(peak, 2),
-            peak_freq_Hz=start.value + binsize.value * vals.index(peak),
+            peak_freq_Hz=info.start + info.bin_size * vals.index(peak),
             median_dBm=round(sorted(finite)[len(finite) // 2], 2),
             min_dBm=round(min(finite), 2),
             all_identical=len(set(finite)) == 1,
         )
     result["nonzero_bins"] = sum(1 for v in vals if v != 0)
-    result["_sweep"] = (start.value, binsize.value, vals)
-    result["transport"] = transport.snapshot()
-    api("smAbort", dev)
+    result["_sweep"] = (info.start, info.bin_size, vals)
+    result["transport"] = sm.transport_snapshot()
+    sm.abort()
     return result
 
 
@@ -502,7 +397,7 @@ def ab_verdict(experiments):
     return line
 
 
-def device_state(api, dev, lib, trace):
+def device_state(sm, trace):
     """Everything queryable that costs nothing and might matter.
 
     Several of these getters fetch the aux block from the device, and a failed
@@ -514,39 +409,33 @@ def device_state(api, dev, lib, trace):
     the status stuck at -6 before the first experiment.
     """
     out = {}
-    dtype, serial = ctypes.c_int(), ctypes.c_int()
-    api("smGetDeviceInfo", dev, ctypes.byref(dtype), ctypes.byref(serial))
-    out["device_type"] = DEVICE_TYPES.get(dtype.value, dtype.value)
-    out["serial"] = serial.value
-    maj, mnr, rev = (ctypes.c_int() for _ in range(3))
-    api("smGetFirmwareVersion", dev, ctypes.byref(maj), ctypes.byref(mnr),
-        ctypes.byref(rev))
-    out["firmware"] = f"{maj.value}.{mnr.value}.{rev.value}"
-    out["api_version"] = lib.smGetAPIVersion().decode()
+
+    def get(label, fn, after):
+        try:
+            out[label] = fn()
+        except SmError as e:
+            out[label] = f"error: {e.message}"
+        trace(after)
+
+    try:
+        i = sm.info
+        out.update(device_type=i.model, serial=i.serial, firmware=i.firmware,
+                   api_version=i.api_version)
+    except SmError as e:
+        out["info"] = f"error: {e.message}"
     trace("smGetDeviceInfo, smGetFirmwareVersion")
-
-    for label, name, count in (("diagnostics", "smGetDeviceDiagnostics", 3),
-                               ("sfp", "smGetSFPDiagnostics", 4)):
-        vals = [ctypes.c_float() for _ in range(count)]
-        if api(name, dev, *[ctypes.byref(v) for v in vals]) == 0:
-            out[label] = [round(v.value, 3) for v in vals]
-        trace(name)
-
-    for label, name in (("power_state", "smGetPowerState"),
-                        ("reference", "smGetReference"),
-                        ("gps_state", "smGetGPSState"),
-                        ("attenuator", "smGetAttenuator"),
-                        ("preselector", "smGetPreselector"),
-                        ("current_mode", "smGetCurrentMode")):
-        v = ctypes.c_int()
-        if api(name, dev, ctypes.byref(v)) == 0:
-            out[label] = v.value
-        trace(name)
-
-    cal = ctypes.c_uint64()
-    if api("smGetCalDate", dev, ctypes.byref(cal)) == 0 and cal.value:
-        out["last_cal"] = time.strftime("%Y-%m-%d", time.gmtime(cal.value))
-    trace("smGetCalDate")
+    get("diagnostics", lambda: [round(v, 3) for v in sm.diagnostics().values()],
+        "smGetDeviceDiagnostics")
+    get("sfp", lambda: [round(v, 3) for v in sm.sfp_diagnostics().values()],
+        "smGetSFPDiagnostics")
+    for label, prop, call in (("power_state", "power_state", "smGetPowerState"),
+                              ("reference", "reference", "smGetReference"),
+                              ("gps_state", "gps_state", "smGetGPSState"),
+                              ("attenuator", "attenuator", "smGetAttenuator"),
+                              ("preselector", "preselector", "smGetPreselector"),
+                              ("current_mode", "mode", "smGetCurrentMode")):
+        get(label, lambda prop=prop: getattr(sm, prop), call)
+    get("last_cal", lambda: str(sm.calibration_date), "smGetCalDate")
     return out
 
 
@@ -628,37 +517,6 @@ def passed(checks):
 
 
 # ---- native backend ---------------------------------------------------------------
-class NativeTransport:
-    """The native backend behind the snapshot() and repair the harness expects.
-
-    Native counters are cumulative, so each snapshot reports the change since
-    the last. The native side keeps no command or aux logs.
-    """
-
-    def __init__(self, native, N):
-        self.native, self.N = native, N
-        self.repair = native.filter_repair
-        self.prev = N.stats(native).as_dict()
-        self.seen = self.repair.seen
-        self.skip = {"filter_repairs", "commands", "first_misframe", "max_outstanding",
-                     "lib_promotions"}
-
-    def snapshot(self):
-        cur = self.N.stats(self.native).as_dict()
-        out = {k: cur[k] - self.prev[k] for k in self.N.STAT_U64 if k not in self.skip}
-        out["calls"] = out["transfers"]
-        out["commands_sent"] = cur["commands"] - self.prev["commands"]
-        out["filter_repair_count"] = cur["filter_repairs"] - self.prev["filter_repairs"]
-        new = min(self.repair.seen - self.seen, len(self.repair.log))
-        out["filter_repairs"] = self.repair.log[-new:] if new else []
-        self.seen = self.repair.seen
-        for k in ("max_outstanding", "lib_promotions", *self.N.STAT_I32):
-            out[k] = cur[k]
-        out.update(commands=[], aux_blocks=[], events=[], raw_sample=None)
-        self.prev = cur
-        return out
-
-
 def native_available():
     import sm_native as N
     try:
@@ -666,28 +524,6 @@ def native_available():
         return True
     except SystemExit:
         return False
-
-
-def install_backend(backend, dylib, filter_mode):
-    """Load the library with one backend installed. Returns (lib, transport, slide)."""
-    if backend == "native":
-        import sm_native as N
-        lib, native = N.install(dylib, filter_mode=filter_mode)
-        bind(lib)
-        anchor = T.symbol_addresses(dylib, {T.ANCHOR_SYM})[T.ANCHOR_SYM]
-        slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - anchor
-        return lib, NativeTransport(native, N), slide
-    addrs = T.symbol_addresses(dylib, {T.VTABLE_SYM, T.ANCHOR_SYM})
-    lib = ctypes.CDLL(dylib)
-    bind(lib)
-    slide = ctypes.cast(lib.smGetAPIVersion, ctypes.c_void_p).value - addrs[T.ANCHOR_SYM]
-    transport = T.Transport(T.load_filter_repair(dylib, slide, filter_mode))
-    T.patch_vtable(addrs[T.VTABLE_SYM] + slide, transport)
-    shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_shim.dylib")
-    if not os.path.exists(shim):
-        sys.exit("sem_shim.dylib not found; build it first")
-    T.patch_semaphores(dylib, slide, shim)
-    return lib, transport, slide
 
 
 # ---- one backend, in this process --------------------------------------------------
@@ -718,25 +554,20 @@ def run_backend(args, names, backend):
     """
     outdir = os.path.join(args.outdir, backend)
     os.makedirs(outdir, exist_ok=True)
-    lib, transport, slide = install_backend(backend, args.dylib, args.filter_repair)
+    try:
+        sm = SM200C(args.dylib, args.host, args.device, args.port, backend=backend,
+                    filter_repair=args.filter_repair)
+    except SmError as e:
+        sys.exit(f"open failed: {e}")
 
-    api = Api(lib)
-    handle = ctypes.c_int(-1)
-    status = api("smOpenNetworkedDevice", ctypes.byref(handle), args.host.encode(),
-                 args.device.encode(), args.port)
-    if status < 0:
-        sys.exit(f"open failed: {status} ({api.err(status)})")
-    dev = handle.value
-
-    open_transport = transport.snapshot()
-    status = T.InterfaceStatus(args.dylib, slide)
-    status_trace = [{"after": "smOpenNetworkedDevice", "status": status.read(dev)}]
+    open_transport = sm.transport_snapshot()
+    status_trace = [{"after": "smOpenNetworkedDevice", "status": sm.connection_status}]
 
     def trace(call):
-        status_trace.append({"after": call, "status": status.read(dev)})
+        status_trace.append({"after": call, "status": sm.connection_status})
 
-    device = device_state(api, dev, lib, trace)
-    state_transport = transport.snapshot()
+    device = device_state(sm, trace)
+    state_transport = sm.transport_snapshot()
     report = {
         "backend": backend,
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -757,6 +588,7 @@ def run_backend(args, names, backend):
         "experiments": [],
     }
     charts = {}
+    api_log = []
 
     def save():
         # After every experiment, so a crash part way keeps what finished.
@@ -784,7 +616,7 @@ def run_backend(args, names, backend):
                  "skipped": "native backend only"})
             continue
         want = cfg.get("repair")
-        if isinstance(want, str) and not (transport.repair and transport.repair.available(want)):
+        if isinstance(want, str) and not sm.filter_repair.available(want):
             reason = ("needs filter_tables.json" if want == "tables"
                       else f"filter repair {want} not available")
             print(f"\n--- {name} ({kind}) --- skipped ({reason})")
@@ -796,20 +628,27 @@ def run_backend(args, names, backend):
         entry = {"name": name, "kind": kind, "config": dict(cfg), "why": why}
         # Each experiment starts clean. A status left at -6 by an earlier one
         # would otherwise fail everything after it; record that it happened.
-        entry["status_in"] = status.clear(dev)
+        entry["status_in"] = sm.clear_connection_status()
         if entry["status_in"]:
             print(f"  status was {entry['status_in']} on entry; cleared")
-        try:
-            if kind == "iq":
-                r = run_iq(api, dev, transport, cfg, args.seconds, args.keep_samples)
-            else:
-                r = run_sweep(api, dev, transport, cfg)
-        except Exception as exc:                       # keep the run going
-            import traceback
-            traceback.print_exc()
-            entry["error"] = f"{type(exc).__name__}: {exc}"
-            r = {"transport": transport.snapshot()}
-        entry["status_out"] = status.read(dev)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SmWarning)
+            try:
+                if kind == "iq":
+                    r = run_iq(sm, cfg, args.seconds, args.keep_samples)
+                else:
+                    r = run_sweep(sm, cfg)
+            except Exception as exc:                   # keep the run going
+                import traceback
+                traceback.print_exc()
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+                r = {"transport": sm.transport_snapshot()}
+        if caught:
+            entry["warnings"] = [str(w.message) for w in caught]
+            api_log.extend(entry["warnings"])
+        if r.get("error"):
+            api_log.append(r["error"])
+        entry["status_out"] = sm.connection_status
         t = r.pop("transport", {})
         raw = t.pop("raw_sample", None)
         if raw:
@@ -840,10 +679,9 @@ def run_backend(args, names, backend):
     report["ab_verdict"] = ab_verdict(report["experiments"])
     if report["ab_verdict"]:
         print("\n=== filter A/B ===\n  " + report["ab_verdict"])
-    report["filter_repair"] = transport.repair.mode if transport.repair else "off"
-    report["api_errors"] = api.log
-    api("smAbort", dev)
-    api("smCloseDevice", dev)
+    report["filter_repair"] = sm.filter_repair.mode
+    report["api_errors"] = api_log
+    sm.close()
     report["completed"] = True
     save()
     return report, charts
@@ -984,9 +822,9 @@ document.getElementById('body').innerHTML = h;
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dylib", nargs="?")
-    ap.add_argument("--host", default="192.168.2.2")
-    ap.add_argument("--device", default="192.168.2.10")
-    ap.add_argument("--port", type=int, default=51665)
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--device", default=DEFAULT_DEVICE)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--all", action="store_true", help="run every experiment")
     ap.add_argument("--only", help="comma-separated experiment names")
     ap.add_argument("--list", action="store_true", help="show experiments and exit")

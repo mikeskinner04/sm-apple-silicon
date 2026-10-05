@@ -131,12 +131,13 @@ Useful options:
 | `--out` | output path; several frequencies each get a suffix |
 | `--filter-repair` | `design` (default), `tables`, or `off` to send the library's own uploads |
 | `--no-filter-repair` | same as `--filter-repair off` |
-| `--native` | use the C backend; needed below decimation 8 |
+| `--backend` | `native` (default) or `python`; Python only keeps up to about 25 MS/s |
 | `--discard` | read the stream but write nothing, to test the link without the disk |
 | `--no-promote` | native only: leave the library's thread priorities alone |
 
-Without `--native` the receive loop is Python, one datagram at a time, which
-holds about 25 MS/s. For anything faster see the next section.
+The native backend is the default. With `--backend python` the receive loop is
+Python, one datagram at a time, which holds about 25 MS/s; it is there for
+comparison. The old `--native` flag is still accepted and does nothing.
 
 Retuning is `smSetIQCenterFreq` followed by `smConfigure`, and `smConfigure`
 calls `smAbort` internally, so every hop tears down the engine thread and its
@@ -146,8 +147,8 @@ semaphores and builds new ones. The frequency printed is read back with
 ## 6. Full rate: decimation 1
 
 Decimation 1 is 200 MS/s: 800 MB/s off the wire, about 97,600 datagrams a
-second. Use `--native`, which points the ten transport methods at C functions
-and receives on a dedicated thread, so no Python runs on the data path.
+second. The native backend, the default, points the ten transport methods at C
+functions and receives on a dedicated thread, so no Python runs on the data path.
 
 Before a run:
 
@@ -160,9 +161,9 @@ Before a run:
 Then, in this order:
 
 ```
-python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --native --decimation 1 --short --seconds 10 --discard
-python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --native --decimation 1 --short --seconds 10
-python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --native --decimation 1 --short --seconds 10 --discard --no-promote
+python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --decimation 1 --short --seconds 10 --discard
+python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --decimation 1 --short --seconds 10
+python3 sm_iq_capture.py ./libsm_api.2.3.7.dylib --decimation 1 --short --seconds 10 --discard --no-promote
 ```
 
 The first proves the link and the transport with the disk out of the picture.
@@ -375,8 +376,8 @@ same as getting correct bytes out.
 | `AllocateResources failed` | usually no route to the device, or the address is not on the interface | check `ifconfig` and the ARP table |
 | Open hangs, or a retune hangs on the second hop | `sem_destroy` arriving while another thread sits in `sem_wait` | known race in the shim; its mutexes and condvars are created once per slot and never destroyed, which takes the worst of it away but does not close it |
 | `SO_RCVBUF 8388608 (asked 100000000)` | macOS caps the request | expected, see below |
-| datagram gaps at high rates with the Python backend | the Python loop fell behind | use `--native` |
-| `DATA LOSS: ... lost in transit` with `--native` | receiver thread held off, or drops in the adapter | see section 6 for telling the two apart |
+| datagram gaps at high rates with the Python backend | the Python loop fell behind | use the native backend, the default |
+| `DATA LOSS: ... lost in transit` with the native backend | receiver thread held off, or drops in the adapter | see section 6 for telling the two apart |
 | `I/Q data loss N` printed by the library | the device's buffer overflowed; requests fell behind | check the library thread priority line and the queue ran dry count |
 | `transfer timeouts` | the device stopped answering; the library's error state is now stuck | close and reopen the device |
 | every I/Q experiment reads "no data: Device connection lost" | the connection-lost status was already -6 | the setup status table in the report names the call that set it |
@@ -417,7 +418,67 @@ generator or a known strong emitter:
 Do the out-of-band test at decimation 8 or below. Above that, the separate
 host-side filter stub aliases regardless of what the device does.
 
-## 12. Extending it
+## 12. Using it from Python
+
+`sm200c.py` wraps the whole SM API for tuning, sweeps and the four I/Q modes
+in one class, with the transport and filter repairs already applied. Both
+scripts are built on it.
+
+```python
+from sm200c import SM200C, SweepListStep, Segment
+
+with SM200C("./libsm_api.2.3.7.dylib") as sm:      # host, device, port default
+    print(sm.info, sm.diagnostics())
+
+    # Front end
+    sm.ref_level = -20             # dBm; puts the attenuator on auto
+    sm.attenuator = 2              # or a fixed 10 dB; None for auto
+    sm.preselector = True
+
+    # Sweeps
+    info = sm.configure_sweep(center=2.442e9, span=80e6, rbw=30e3)
+    trace = sm.sweep()             # trace.freqs, trace.min, trace.max (dBm)
+    for trace in sm.sweeps(count=100, depth=4):    # queued in the device
+        ...
+
+    # I/Q streaming
+    iq = sm.configure_iq(center=1e9, decimation=8)  # iq.sample_rate, iq.correction
+    block = sm.read_iq(1 << 20)    # block.samples is complex64
+    for block in sm.stream_iq(count=200):
+        ...
+
+    # 16-bit at full rate, reusing one buffer
+    sm.configure_iq(center=1e9, decimation=1, data_type="int16")
+    buf = sm.iq_buffer(1 << 20)
+    block = sm.read_iq(1 << 20, out=buf)            # block.complex() to convert
+
+    # I/Q sweep list, segmented and full band
+    sm.configure_iq_sweep_list([SweepListStep(1e9, 4096), SweepListStep(2e9, 4096)])
+    hop = sm.iq_sweep_list()       # hop.samples[i] per step
+    sm.configure_segmented(center=2e9, segments=[Segment(100_000)])
+    segs = sm.capture_segmented()
+    sm.configure_full_band(samples=32768)
+    cap = sm.full_band(sm.full_band_index(2.4e9))
+```
+
+API errors raise `SmError`, carrying the call, status and message. Warning
+statuses, such as a setting being clamped, are issued as `SmWarning`, except
+from the read calls: each `IQBlock` and `Sweep` carries its own status, and a
+sync error on a read is reported as `block.sync_error` because the samples
+still arrived. `read_iq` purges the API's buffer on the first read after
+`configure_iq`.
+
+The native backend is the default and must be built (`make -C native`).
+`backend="python"` exists for the diagnostics' side-by-side runs. A process
+can load the library with one backend only, so the diagnostics run each
+backend in a process of its own.
+
+Only streaming and sweeps have been run on this transport. The sweep list,
+segmented and full-band calls follow `sm_api.h` exactly but are untested here,
+and the header describes segmented capture as an SM200B and SM435B feature,
+so an SM200C may refuse it.
+
+## 13. Extending it
 
 **Adding a diagnostic experiment.** Add an entry to `EXPERIMENTS` in
 `sm_diag.py`: a name, the kind (`iq` or `sweep`), a config dict, and a sentence
